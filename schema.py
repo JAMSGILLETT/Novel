@@ -122,14 +122,25 @@ class DependencyGraphHit(BaseModel):
     content: str
 
 
+class CharacterRosterEntry(BaseModel):
+    """Lightweight record of every character the story has ever introduced.
+    Always included in ContextPack so the Story Planner knows who exists,
+    even if their full Character record wasn't pulled by retrieval."""
+    id: str
+    name: str
+    is_alive: bool = True
+    current_location_id: Optional[str] = None
+
+
 class ContextPack(BaseModel):
     pov_state: Optional[POVState]  # None on cold start before POV is established
-    active_characters: list[Character]
-    active_plotlines: list[Plotline]
+    character_roster: list[CharacterRosterEntry]  # all characters, always present
+    active_characters: list[Character]      # full details, retrieved subset
+    active_plotlines: list[Plotline]        # all active plotlines, always present
     nearby_locations: list[Location]
-    relevant_world_rules: list[WorldRule]
+    relevant_world_rules: list[WorldRule]   # all world rules, always present
     relevant_world_lore: list[WorldLore]
-    last_chapter_summary: Optional[ChapterSummary]
+    last_chapter_summary: Optional[ChapterSummary]  # always present if exists
     dependency_graph_hits: list[DependencyGraphHit] = Field(default_factory=list)
     vector_search_scores: dict[str, float] = Field(default_factory=dict)
 
@@ -151,6 +162,13 @@ class StoryPlan(BaseModel):
     narrative_goals: list[str]
     character_constraints: list[CharacterConstraint]
     required_callbacks: list[str]
+    requested_offscreen_character_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "IDs from the character roster that are not currently in active_characters "
+            "but should be brought into this chapter. Node 4 will fetch their full profiles."
+        ),
+    )
 
 
 class CharacterReasoning(BaseModel):

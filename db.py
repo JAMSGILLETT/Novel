@@ -62,12 +62,10 @@ def init_db(db_path: Optional[Path] = None) -> None:
         )""",
         """CREATE TABLE IF NOT EXISTS world_rules (
             id TEXT PRIMARY KEY,
-            story_id TEXT NOT NULL,
             json_data TEXT NOT NULL
         )""",
         """CREATE TABLE IF NOT EXISTS world_lore (
             id TEXT PRIMARY KEY,
-            story_id TEXT NOT NULL,
             json_data TEXT NOT NULL
         )""",
         """CREATE TABLE IF NOT EXISTS pov_state (
@@ -172,17 +170,42 @@ def get_location_by_id(
 
 
 def get_world_rule_by_id(
-    entity_id: str, story_id: str, db_path: Optional[Path] = None
+    entity_id: str, db_path: Optional[Path] = None
 ) -> Optional[WorldRule]:
-    raw = _get_entity_json("world_rules", entity_id, story_id, db_path)
-    return WorldRule.model_validate_json(raw) if raw else None
+    conn = get_connection(db_path)
+    row = conn.execute(
+        "SELECT json_data FROM world_rules WHERE id = ?", (entity_id,)
+    ).fetchone()
+    conn.close()
+    return WorldRule.model_validate_json(row["json_data"]) if row else None
 
 
 def get_world_lore_by_id(
-    entity_id: str, story_id: str, db_path: Optional[Path] = None
+    entity_id: str, db_path: Optional[Path] = None
 ) -> Optional[WorldLore]:
-    raw = _get_entity_json("world_lore", entity_id, story_id, db_path)
-    return WorldLore.model_validate_json(raw) if raw else None
+    conn = get_connection(db_path)
+    row = conn.execute(
+        "SELECT json_data FROM world_lore WHERE id = ?", (entity_id,)
+    ).fetchone()
+    conn.close()
+    return WorldLore.model_validate_json(row["json_data"]) if row else None
+
+
+def get_all_characters(story_id: str, db_path: Optional[Path] = None) -> List[Character]:
+    rows = _get_all_json("characters", story_id, db_path)
+    return [Character.model_validate_json(r) for r in rows]
+
+
+def get_all_plotlines(story_id: str, db_path: Optional[Path] = None) -> List[Plotline]:
+    rows = _get_all_json("plotlines", story_id, db_path)
+    return [Plotline.model_validate_json(r) for r in rows]
+
+
+def get_all_world_rules(db_path: Optional[Path] = None) -> List[WorldRule]:
+    conn = get_connection(db_path)
+    rows = conn.execute("SELECT json_data FROM world_rules").fetchall()
+    conn.close()
+    return [WorldRule.model_validate_json(r["json_data"]) for r in rows]
 
 
 def get_pov_state(story_id: str, db_path: Optional[Path] = None) -> Optional[POVState]:
@@ -259,21 +282,21 @@ def upsert_location(loc: Location, story_id: str, db_path: Optional[Path] = None
     conn.close()
 
 
-def upsert_world_rule(r: WorldRule, story_id: str, db_path: Optional[Path] = None) -> None:
+def upsert_world_rule(r: WorldRule, db_path: Optional[Path] = None) -> None:
     conn = get_connection(db_path)
     conn.execute(
-        "INSERT OR REPLACE INTO world_rules (id, story_id, json_data) VALUES (?, ?, ?)",
-        (r.id, story_id, r.model_dump_json()),
+        "INSERT OR REPLACE INTO world_rules (id, json_data) VALUES (?, ?)",
+        (r.id, r.model_dump_json()),
     )
     conn.commit()
     conn.close()
 
 
-def upsert_world_lore(l: WorldLore, story_id: str, db_path: Optional[Path] = None) -> None:
+def upsert_world_lore(l: WorldLore, db_path: Optional[Path] = None) -> None:
     conn = get_connection(db_path)
     conn.execute(
-        "INSERT OR REPLACE INTO world_lore (id, story_id, json_data) VALUES (?, ?, ?)",
-        (l.id, story_id, l.model_dump_json()),
+        "INSERT OR REPLACE INTO world_lore (id, json_data) VALUES (?, ?)",
+        (l.id, l.model_dump_json()),
     )
     conn.commit()
     conn.close()
