@@ -52,12 +52,20 @@ class Location(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
-class LoreEntry(BaseModel):
+class WorldRule(BaseModel):
+    """Hard fixed constraints that can never be violated: magic systems, physics, etc."""
     id: str = Field(default_factory=gen_id)
-    category: Literal["magic_system", "politics", "physics", "social_rules", "canon_fact"]
+    rule_type: Literal["magic_system", "physics", "social_rule", "hard_constraint"]
     title: str
     content: str
-    is_fixed_constraint: bool = True
+
+
+class WorldLore(BaseModel):
+    """Discoverable world knowledge: history, politics, culture, canon facts."""
+    id: str = Field(default_factory=gen_id)
+    category: Literal["history", "politics", "geography", "culture", "canon_fact"]
+    title: str
+    content: str
 
 
 class POVState(BaseModel):
@@ -83,21 +91,23 @@ class ChapterSummary(BaseModel):
 
 class RetrievalConfig(BaseModel):
     vector_hit_threshold: dict[
-        Literal["character", "plotline", "location", "lore", "chapter_summary"], float
+        Literal["character", "plotline", "location", "world_rule", "world_lore", "chapter_summary"], float
     ] = Field(default_factory=lambda: {
         "character": 0.75,
         "plotline": 0.75,
         "location": 0.70,
-        "lore": 0.80,
+        "world_rule": 0.85,
+        "world_lore": 0.75,
         "chapter_summary": 0.70,
     })
     max_results_per_type: dict[
-        Literal["character", "plotline", "location", "lore", "chapter_summary"], int
+        Literal["character", "plotline", "location", "world_rule", "world_lore", "chapter_summary"], int
     ] = Field(default_factory=lambda: {
         "character": 6,
         "plotline": 4,
         "location": 3,
-        "lore": 5,
+        "world_rule": 4,
+        "world_lore": 5,
         "chapter_summary": 1,
     })
 
@@ -113,11 +123,12 @@ class DependencyGraphHit(BaseModel):
 
 
 class ContextPack(BaseModel):
-    pov_state: POVState
+    pov_state: Optional[POVState]  # None on cold start before POV is established
     active_characters: list[Character]
     active_plotlines: list[Plotline]
     nearby_locations: list[Location]
-    relevant_lore: list[LoreEntry]
+    relevant_world_rules: list[WorldRule]
+    relevant_world_lore: list[WorldLore]
     last_chapter_summary: Optional[ChapterSummary]
     dependency_graph_hits: list[DependencyGraphHit] = Field(default_factory=list)
     vector_search_scores: dict[str, float] = Field(default_factory=dict)
@@ -210,8 +221,16 @@ class LocationPatch(BaseModel):
     source: str = "memory_extractor"
 
 
-class LorePatch(BaseModel):
-    entity_type: Literal["lore"] = "lore"
+class WorldRulePatch(BaseModel):
+    entity_type: Literal["world_rule"] = "world_rule"
+    entity_id: Optional[str] = None
+    title: Optional[str] = None
+    content: Optional[str] = None
+    source: str = "memory_extractor"
+
+
+class WorldLorePatch(BaseModel):
+    entity_type: Literal["world_lore"] = "world_lore"
     entity_id: Optional[str] = None
     title: Optional[str] = None
     content: Optional[str] = None
@@ -232,9 +251,20 @@ class POVPatch(BaseModel):
 
 
 MemoryPatch = Annotated[
-    Union[CharacterPatch, PlotlinePatch, LocationPatch, LorePatch, POVPatch],
+    Union[CharacterPatch, PlotlinePatch, LocationPatch, WorldRulePatch, WorldLorePatch, POVPatch],
     Field(discriminator="entity_type"),
 ]
+
+
+class CanonRule(BaseModel):
+    """A manually authored dependency-graph rule stored in SQLite."""
+    rule_id: str
+    story_id: str
+    trigger_entity_type: str
+    trigger_entity_id: str
+    inject_entity_type: Literal["character", "plotline", "location", "world_rule", "world_lore"]
+    inject_entity_id: str
+    reason: str
 
 
 class ReconciliationConflict(BaseModel):
