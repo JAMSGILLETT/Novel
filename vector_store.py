@@ -14,8 +14,17 @@ Install: pip install chromadb==0.4.24
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+try:
+    import posthog
+    posthog.capture = lambda *args, **kwargs: None
+    posthog.identify = lambda *args, **kwargs: None
+    posthog.Posthog.capture = lambda self, *args, **kwargs: None
+except Exception:
+    pass
 
 CHROMA_PATH = Path(__file__).parent / "novelgen_chroma"
 
@@ -28,19 +37,26 @@ COLLECTION_FOR = {
     "location": "locations",
     "world_rule": "world_rules",
     "world_lore": "world_lore",
+    "world_entity": "world_entities",
     "chapter_summary": "chapter_summaries",
 }
 
 
+def _chroma_settings():
+    from chromadb.config import Settings
+    return Settings(anonymized_telemetry=False)
+
+
 def get_chroma_client(path: Optional[Path] = None):
     import chromadb
-    return chromadb.PersistentClient(path=str(path or CHROMA_PATH))
+    return chromadb.PersistentClient(path=str(path or CHROMA_PATH),
+                                     settings=_chroma_settings())
 
 
 def get_ephemeral_client():
     """For tests only — in-memory, no disk."""
     import chromadb
-    return chromadb.EphemeralClient()
+    return chromadb.EphemeralClient(settings=_chroma_settings())
 
 
 def _collection(client, entity_type: str):
@@ -89,12 +105,23 @@ def chapter_summary_text(s) -> str:
     return s.medium_summary
 
 
+def world_entity_text(e) -> str:
+    parts = [f"[{e.category}] {e.name}", e.description]
+    for k, v in e.attributes.items():
+        if isinstance(v, list):
+            parts.append(f"{k}: {', '.join(str(i) for i in v)}")
+        else:
+            parts.append(f"{k}: {v}")
+    return ". ".join(p for p in parts if p)
+
+
 ENTITY_TEXT_FN = {
     "character": character_text,
     "plotline": plotline_text,
     "location": location_text,
     "world_rule": world_rule_text,
     "world_lore": world_lore_text,
+    "world_entity": world_entity_text,
     "chapter_summary": chapter_summary_text,
 }
 

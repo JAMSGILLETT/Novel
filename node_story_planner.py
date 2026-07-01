@@ -13,26 +13,33 @@ everything downstream:
   requested_offscreen_character_ids — roster IDs the planner wants pulled in from
                                     off-screen; Node 4 fetches their full profiles
 
-Model: Llama 3.3 70B Instruct via OpenRouter (free tier).
+Model: local Ollama server (OpenAI-compatible API on localhost:11434).
+Default model: llama3.1:8b — override with NOVELGEN_MODEL env var.
 Structured output via OpenAI-compatible tool calling — tool_choice is forced to
 "story_plan" so the model cannot return freeform text.
 
 Requires:
   pip install openai
-  OPENROUTER_API_KEY environment variable set.
+  Ollama installed and running (https://ollama.com)
+  Model pulled: ollama pull llama3.1:8b   (or whatever NOVELGEN_MODEL is set to)
 """
 from __future__ import annotations
 
-import json
 import os
+import time
 from typing import Callable, Optional
 
+from llm_json import parse_json_response
 from schema import (
     CharacterRosterEntry, ContextPack, ChapterGraphState, StoryPlan,
 )
 
-MODEL = "meta-llama/llama-3.3-70b-instruct:free"
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_MODEL = "qwen2.5:14b-instruct-q4_K_M"
+OLLAMA_BASE_URL = "http://localhost:11434/v1"
+
+# Override the model at runtime without touching code:
+#   set NOVELGEN_MODEL=llama3.3:70b
+MODEL = os.environ.get("NOVELGEN_MODEL", DEFAULT_MODEL)
 
 
 # ---------------------------------------------------------------------------
@@ -122,11 +129,37 @@ def _fmt_locations(pack: ContextPack) -> str:
     )
 
 
-def _fmt_history(pack: ContextPack) -> str:
+def full_history_text(act_summaries: list[str], book_summary: Optional[str]) -> str:
+    """Joins permanent per-act summaries with the current rolling summary since
+    the last act boundary — the hierarchical replacement for a single
+    ever-growing book_summary string. Early acts are never re-compressed, so
+    they survive intact no matter how long the novel gets."""
+    parts = []
+    if act_summaries:
+        parts.append("\n\n".join(act_summaries))
+    if book_summary:
+        parts.append(book_summary)
+    return "\n\n".join(parts) if parts else ""
+
+
+def _fmt_history(pack: ContextPack, book_summary: Optional[str] = None) -> str:
+    lines = []
+    if book_summary:
+        lines.append(f"NOVEL SO FAR:\n{book_summary}")
     s = pack.last_chapter_summary
-    if s is None:
-        return "  This is the first chapter — no prior history."
-    return f"  Chapter {s.chapter_number}: {s.medium_summary}"
+    if s:
+        lines.append(f"LAST CHAPTER (Chapter {s.chapter_number}):\n{s.medium_summary}")
+    return "\n\n".join(lines) if lines else "  This is the first chapter — no prior history."
+
+
+def _fmt_stale_plotlines(pack: ContextPack) -> str:
+    if not pack.stale_plotlines:
+        return ""
+    lines = "\n".join(f"  • [{p.id}] {p.name} — stage: {p.progress_stage}" for p in pack.stale_plotlines)
+    return (
+        "\n=== THREADS GOING QUIET (no movement in a while — consider addressing, not mandatory) ===\n"
+        f"{lines}\n"
+    )
 
 
 def _fmt_roster(roster: list) -> str:
@@ -140,7 +173,39 @@ def _fmt_roster(roster: list) -> str:
     )
 
 
-def build_planner_prompt(state: ChapterGraphState) -> str:
+def _fmt_outline(state: ChapterGraphState) -> str:
+    outline = state.story_outline
+    if outline is None:
+        return "  (no outline yet)"
+    roster_names = {e.id: e.name for e in (state.context_pack.character_roster if state.context_pack else [])}
+
+    lines = []
+    if outline.premise:
+        lines.append(f"Premise: {outline.premise}")
+    if outline.theme:
+        lines.append(f"Theme: {outline.theme}")
+    if outline.planned_ending:
+        lines.append(f"Planned ending: {outline.planned_ending}")
+
+    open_beats = [b for b in outline.beats if b.status != "completed"]
+    if open_beats:
+        lines.append("Beats still ahead:")
+        lines.extend(f"  • [{b.status}] {b.description}" for b in open_beats)
+
+    if outline.character_arcs:
+        lines.append("Character arcs:")
+        for a in outline.character_arcs:
+            name = roster_names.get(a.character_id, a.character_id[:8])
+            stage = f" (currently: {a.current_stage})" if a.current_stage else ""
+            lines.append(f"  • {name}: {a.arc_summary}{stage}")
+
+    return "\n".join(lines) if lines else "  (outline not yet populated)"
+
+
+def build_planner_prompt(state: ChapterGraphState, template: Optional[str] = None) -> str:
+    from prompt_templates import DEFAULT_TEMPLATES
+    tpl = template if template is not None else DEFAULT_TEMPLATES["story_planner"]
+
     pack = state.context_pack
     if pack is None:
         raise ValueError("context_pack must be set before story planner runs")
@@ -167,107 +232,155 @@ def build_planner_prompt(state: ChapterGraphState) -> str:
             for h in pack.dependency_graph_hits
         ) + "\n"
 
-    return f"""You are the Story Director for a collaborative novel. Your job is to PLAN the next chapter — not write it. The Story Writer executes your plan.
-
-=== MODE: {mode_note} ===
-
-=== WORLD RULES (ABSOLUTE — never violate, never have a character or scene violate these) ===
-{_fmt_world_rules(pack)}
-
-=== RELEVANT WORLD LORE ===
-{_fmt_world_lore(pack)}
-
-=== ACTIVE PLOTLINES (advance at least one) ===
-{_fmt_plotlines(pack)}
-
-=== CHARACTERS IN SCENE (full profiles) ===
-{_fmt_characters(pack)}
-
-=== POV STATE ===
-{_fmt_pov(pack)}
-
-=== NEARBY LOCATIONS ===
-{_fmt_locations(pack)}
-
-=== STORY HISTORY ===
-{_fmt_history(pack)}
-{dep_section}
-=== USER DIRECTIVE ===
-"{state.user_input}"
-
-=== FULL CHARACTER ROSTER (all characters including off-screen) ===
-{_fmt_roster(pack.character_roster)}
-  To bring an off-screen character back, put their exact ID in requested_offscreen_character_ids.
-  Do NOT include deceased characters unless their return is plot-justified.
-
-=== YOUR TASK — plan chapter {state.chapter_number} ===
-Produce a StoryPlan with:
-  • scenes: 3–5 ordered scene descriptions forming a coherent chapter arc
-  • pacing_notes: tone and rhythm guidance (e.g. "slow burn, end on a revelation")
-  • conflicts: specific tensions to dramatize this chapter
-  • narrative_goals: what this chapter must accomplish (theme, plot, character)
-  • character_constraints: for each character who appears:
-      - forbidden_actions: things they CANNOT do (consistency or world-rule constraints)
-      - required_callbacks: specific beats or plotline IDs they MUST address
-  • required_callbacks: story-level mandatory beats independent of any single character
-  • requested_offscreen_character_ids: roster IDs you want brought in from off-screen (empty list if none)
-
-Rules:
-  - Never violate World Rules
-  - Do not kill a character without a required_callback justifying it
-  - Reference plotlines by their ID in required_callbacks so the canon checker can verify"""
+    return tpl.format(
+        mode_note=mode_note,
+        outline_block=_fmt_outline(state),
+        world_rules_block=_fmt_world_rules(pack),
+        world_lore_block=_fmt_world_lore(pack),
+        plotlines_block=_fmt_plotlines(pack),
+        characters_block=_fmt_characters(pack),
+        pov_block=_fmt_pov(pack),
+        locations_block=_fmt_locations(pack),
+        history_block=_fmt_history(pack, full_history_text(state.act_summaries, state.book_summary)),
+        dep_section=dep_section,
+        stale_plotlines_block=_fmt_stale_plotlines(pack),
+        user_input=state.user_input,
+        roster_block=_fmt_roster(pack.character_roster),
+        chapter_number=state.chapter_number,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Node
 # ---------------------------------------------------------------------------
 
-def _make_openrouter_client():
+def _make_ollama_client():
     from openai import OpenAI
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        raise EnvironmentError(
-            "OPENROUTER_API_KEY environment variable not set. "
-            "Get a free key at https://openrouter.ai"
-        )
-    return OpenAI(base_url=OPENROUTER_BASE_URL, api_key=api_key)
+    return OpenAI(
+        base_url=OLLAMA_BASE_URL,
+        api_key="ollama",  # Ollama ignores this but the openai client requires a non-empty value
+    )
 
 
 def make_story_planner_node(
     model: str = MODEL,
-    openrouter_client=None,
+    ollama_client=None,
+    db_path=None,
 ) -> Callable[[ChapterGraphState], dict]:
     """
-    Returns a LangGraph node. Pass openrouter_client in tests to inject a mock.
-    In production the real OpenAI client pointed at OpenRouter is built lazily.
+    Returns a LangGraph node. Pass ollama_client in tests to inject a mock.
+    In production the real OpenAI client pointed at the local Ollama server is built lazily.
     """
 
     def _client():
-        return openrouter_client if openrouter_client is not None else _make_openrouter_client()
+        return ollama_client if ollama_client is not None else _make_ollama_client()
 
     def node(state: ChapterGraphState) -> dict:
-        prompt = build_planner_prompt(state)
+        from prompt_templates import get_template
+        template = get_template("story_planner", state.story_id, db_path)
+        prompt = build_planner_prompt(state, template=template)
 
-        response = _client().chat.completions.create(
-            model=model,
-            max_tokens=2048,
-            tools=[{
-                "type": "function",
-                "function": {
-                    "name": "story_plan",
-                    "description": "The structured plan for this chapter of the novel.",
-                    "parameters": StoryPlan.model_json_schema(),
-                },
-            }],
-            tool_choice={"type": "function", "function": {"name": "story_plan"}},
-            messages=[{"role": "user", "content": prompt}],
-        )
+        # Append a JSON template to the prompt so the model knows exactly what
+        # fields are required, then force JSON output via response_format.
+        full_prompt = prompt + _JSON_TEMPLATE
+        for attempt in range(3):
+            try:
+                response = _client().chat.completions.create(
+                    model=model,
+                    max_tokens=4096,
+                    timeout=600,
+                    response_format={"type": "json_object"},
+                    messages=[{"role": "user", "content": full_prompt}],
+                )
+                break
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                wait = 2 ** attempt * 3
+                print(f"  Ollama error — retrying in {wait}s (attempt {attempt + 1}/3): {e}")
+                time.sleep(wait)
 
-        tool_call = response.choices[0].message.tool_calls[0]
-        plan = StoryPlan.model_validate_json(tool_call.function.arguments)
+        plan = _extract_plan(response)
         return {"story_plan": plan}
 
     return node
 
 
-story_planner_node = make_story_planner_node()
+def _extract_plan(response) -> StoryPlan:
+    """Extract StoryPlan from the response (response_format=json_object path)."""
+    msg = response.choices[0].message
+    raw_content = msg.content or ""
+    data = parse_json_response(raw_content, error_label="Story planner")
+    return _parse_plan_json(data)
+
+
+def _parse_plan_json(data: dict) -> StoryPlan:
+    """Apply defaults for any missing fields, then validate.
+
+    Schema stays strict — defaults live here in the parser, not in the model.
+    """
+    # Apply top-level defaults for any missing fields
+    for key, default in _PLAN_DEFAULTS.items():
+        if key not in data:
+            data[key] = default
+
+    # Apply per-constraint defaults
+    constraints = data.get("character_constraints", [])
+    if isinstance(constraints, list):
+        for i, cc in enumerate(constraints):
+            if isinstance(cc, dict):
+                for key, default in _CONSTRAINT_DEFAULTS.items():
+                    if key not in cc:
+                        cc[key] = default
+
+    return StoryPlan.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# JSON output template — appended to the prompt so models know exactly
+# what fields are required. response_format=json_object forces valid JSON;
+# this template ensures the right keys are present.
+# ---------------------------------------------------------------------------
+_JSON_TEMPLATE = """
+
+=== OUTPUT FORMAT (respond with ONLY this JSON, no other text) ===
+{
+  "scenes": ["scene description 1", "scene description 2", "scene description 3"],
+  "pacing_notes": "tone and rhythm guidance",
+  "conflicts": ["conflict 1", "conflict 2"],
+  "narrative_goals": ["goal 1", "goal 2"],
+  "character_constraints": [
+    {
+      "character_id": "exact-character-id-from-roster",
+      "forbidden_actions": ["thing they cannot do"],
+      "required_callbacks": ["beat they must address"]
+    }
+  ],
+  "required_callbacks": ["story-level beat 1"],
+  "target_word_count": 1000,
+  "requested_offscreen_character_ids": []
+}"""
+
+# ---------------------------------------------------------------------------
+# Defaults applied when a model omits a required field.
+# Schema stays strict; parser is lenient.
+# ---------------------------------------------------------------------------
+_PLAN_DEFAULTS: dict = {
+    "scenes": [],
+    "pacing_notes": "",
+    "conflicts": [],
+    "narrative_goals": [],
+    "character_constraints": [],
+    "required_callbacks": [],
+    "target_word_count": 1000,
+    "requested_offscreen_character_ids": [],
+}
+
+_CONSTRAINT_DEFAULTS: dict = {
+    "character_id": "",
+    "forbidden_actions": [],
+    "required_callbacks": [],
+}
+
+
+story_planner_node = make_story_planner_node()  # uses NOVELGEN_MODEL env var, falls back to DEFAULT_MODEL

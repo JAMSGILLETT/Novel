@@ -6,11 +6,14 @@ Produces a ContextPack via two passes:
 MANDATORY PASS (always included regardless of relevance score):
   - All WorldRules (global hard constraints, never skip)
   - All active Plotlines (status="active") — open threads must never be dropped
-  - POV character's companions (from POVState.companions)
+  - POV character only (from POVState.pov_character_id)
   - POV character's current Location (from POVState.location_id)
   - Last chapter summary (anchors continuity)
   - Full character roster (id/name/alive for every character ever introduced,
     so the Story Planner can reference off-screen characters by name)
+
+  All other characters (including companions) are pulled by vector search only —
+  they must be relevant to the current prompt or last summary to appear.
 
 VECTOR PASS (relevance-ranked, filtered by per-type thresholds):
   - Characters, plotlines, locations, world_lore searched by embedding
@@ -23,6 +26,13 @@ DEPENDENCY GRAPH PASS:
   - For every entity found so far, look up canon_rules in SQLite
   - Inject specified entities unconditionally (bypassing threshold)
   - Record as DependencyGraphHit so downstream nodes know why it appeared
+
+STALE-PLOTLINE AUDIT:
+  - Pure chapter-count check (no LLM, no extra DB call) over active_plotlines
+  - Any active plotline untouched by a patch for STALE_PLOTLINE_THRESHOLD+
+    chapters is recorded on ContextPack.stale_plotlines — logged by the
+    pipeline and surfaced to the Story Planner as a soft nudge, never a hard
+    requirement
 
 Factory pattern: make_context_builder_node() injects dependencies so tests
 can pass a FakeEmbedder and EphemeralClient without touching production singletons.
@@ -41,6 +51,8 @@ from schema import (
     Location, Plotline, WorldLore, WorldRule,
     ChapterGraphState,
 )
+
+STALE_PLOTLINE_THRESHOLD = 8  # chapters an active plotline can go untouched before it's flagged as going quiet
 
 
 def make_context_builder_node(
@@ -65,22 +77,29 @@ def make_context_builder_node(
         # ------------------------------------------------------------------ #
 
         all_world_rules: List[WorldRule] = db.get_all_world_rules(db_path)
+        all_world_lore: List[WorldLore] = db.get_all_world_lore(db_path)
 
         all_plotlines = db.get_all_plotlines(story_id, db_path)
         active_plotlines: List[Plotline] = [
             p for p in all_plotlines if p.status == "active"
         ]
 
+        # Stale-plotline audit: active threads nobody's touched in a while.
+        # Pure chapter-count check, no extra DB call — active_plotlines is already loaded above.
+        stale_plotlines: List[Plotline] = [
+            p for p in active_plotlines
+            if state.chapter_number - p.last_touched_chapter >= STALE_PLOTLINE_THRESHOLD
+        ]
+
         pov = db.get_pov_state(story_id, db_path)
 
         mandatory_characters: List[Character] = []
         mandatory_char_ids: Set[str] = set()
-        if pov:
-            for cid in pov.companions:
-                c = db.get_character_by_id(cid, story_id, db_path)
-                if c and cid not in mandatory_char_ids:
-                    mandatory_characters.append(c)
-                    mandatory_char_ids.add(cid)
+        if pov and pov.pov_character_id:
+            c = db.get_character_by_id(pov.pov_character_id, story_id, db_path)
+            if c:
+                mandatory_characters.append(c)
+                mandatory_char_ids.add(pov.pov_character_id)
 
         mandatory_locations: List[Location] = []
         mandatory_loc_ids: Set[str] = set()
@@ -98,7 +117,7 @@ def make_context_builder_node(
             CharacterRosterEntry(
                 id=c.id,
                 name=c.name,
-                is_alive=True,         # patches update this; default until Node 9 writes
+                is_alive=c.is_alive,
                 current_location_id=c.current_location_id,
             )
             for c in all_characters
@@ -126,8 +145,7 @@ def make_context_builder_node(
         char_hits = _search("character")
         plot_hits = _search("plotline")
         loc_hits = _search("location")
-        lore_hits = _search("world_lore")
-        # world_rule intentionally skipped — all rules already in mandatory pass
+        # world_rule and world_lore skipped — all loaded in mandatory pass above
 
         # Fetch full entities, skip anything already in mandatory set
         mandatory_plot_ids: Set[str] = {p.id for p in active_plotlines}
@@ -144,15 +162,25 @@ def make_context_builder_node(
             loc_hits, mandatory_loc_ids,
             lambda eid: db.get_location_by_id(eid, story_id, db_path),
         )
-        world_lore: List[WorldLore] = _fetch_all(
-            lore_hits,
-            lambda eid: db.get_world_lore_by_id(eid, db_path),
-        )
+
+        # NAME-MATCH PASS: if a character's name appears literally in the user
+        # input, include them regardless of vector score. Covers the common case
+        # where the user types "Kael confronts Mira" and Mira misses the threshold.
+        user_input_lower = state.user_input.lower()
+        all_char_ids_so_far = mandatory_char_ids | {c.id for c in vector_characters}
+        name_matched_characters: List[Character] = []
+        for c in all_characters:
+            if c.id in all_char_ids_so_far:
+                continue
+            if c.name.lower() in user_input_lower:
+                name_matched_characters.append(c)
+                all_char_ids_so_far.add(c.id)
 
         # Merge
-        characters = mandatory_characters + vector_characters
+        characters = mandatory_characters + vector_characters + name_matched_characters
         plotlines = active_plotlines + vector_plotlines
         locations = mandatory_locations + vector_locations
+        world_lore = all_world_lore
 
         # ------------------------------------------------------------------ #
         # DEPENDENCY GRAPH PASS                                                #
@@ -197,6 +225,7 @@ def make_context_builder_node(
             last_chapter_summary=last_summary,
             dependency_graph_hits=dep_hits,
             vector_search_scores=all_scores,
+            stale_plotlines=stale_plotlines,
         )
         return {"context_pack": pack}
 
