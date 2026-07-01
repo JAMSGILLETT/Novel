@@ -27,12 +27,11 @@ Plain text response — no tool call, no JSON parsing.
 """
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Callable, Optional
 
 import db
-from node_story_planner import OLLAMA_BASE_URL, MODEL
+from llm_client import MODEL, chat_text
 from schema import (
     Character, CharacterReasoning, ChapterGraphState, ContextPack, StoryPlan,
 )
@@ -255,12 +254,6 @@ def make_story_writer_node(
     db_path: Optional[Path] = None,
 ) -> Callable[[ChapterGraphState], dict]:
 
-    def _client():
-        if ollama_client is not None:
-            return ollama_client
-        from openai import OpenAI
-        return OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
-
     def node(
         state: ChapterGraphState,
         violation_feedback: Optional[list[str]] = None,
@@ -274,23 +267,11 @@ def make_story_writer_node(
             template=template, revision_template=revision_template,
         )
 
-        for attempt in range(3):
-            try:
-                response = _client().chat.completions.create(
-                    model=model,
-                    max_tokens=4096,
-                    timeout=900,  # 15 min — 70B writing 1200 words takes a while
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                break
-            except Exception as e:
-                if attempt == 2:
-                    raise
-                wait = 2 ** attempt * 3
-                print(f"  Ollama error — retrying in {wait}s (attempt {attempt + 1}/3): {e}")
-                time.sleep(wait)
-
-        prose = (response.choices[0].message.content or "").strip()
+        prose = chat_text(
+            prompt, model=model, max_tokens=4096,
+            timeout=900,  # 15 min — 70B writing 1200 words takes a while
+            client=ollama_client, label="Story writer",
+        )
 
         target = state.story_plan.target_word_count if state.story_plan else 1000
         MIN_WORDS = int(target * 0.7)  # continuation-trigger floor — below this, ask for more
@@ -303,13 +284,10 @@ def make_story_writer_node(
                 f"Begin directly after this passage:\n\n{prose[-300:]}"
             )
             try:
-                cont_response = _client().chat.completions.create(
-                    model=model,
-                    max_tokens=2048,
-                    timeout=900,
-                    messages=[{"role": "user", "content": continuation_prompt}],
+                continuation = chat_text(
+                    continuation_prompt, model=model, max_tokens=2048, timeout=900,
+                    client=ollama_client, retries=1, label="Story writer (continuation)",
                 )
-                continuation = (cont_response.choices[0].message.content or "").strip()
                 if continuation:
                     prose = prose + "\n\n" + continuation
             except Exception as e:

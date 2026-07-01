@@ -16,11 +16,9 @@ Structured output via tool-calling with the same json_repair fallback chain.
 from __future__ import annotations
 
 import json as _json
-import time
 from typing import Callable, Optional
 
-from llm_json import parse_json_response
-from node_story_planner import OLLAMA_BASE_URL, MODEL
+from llm_client import MODEL, chat
 from schema import ChapterGraphState, ChapterSummary
 
 _OUTPUT_FORMAT = """
@@ -89,11 +87,28 @@ def make_chapter_summarizer_node(
     db_path=None,
 ) -> Callable[[ChapterGraphState], dict]:
 
-    def _client():
-        if ollama_client is not None:
-            return ollama_client
-        from openai import OpenAI
-        return OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+    _SUMMARY_TOOL = [{
+        "type": "function",
+        "function": {
+            "name": "chapter_summary",
+            "description": "Structured summary of a novel chapter.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "short_summary": {"type": "string"},
+                    "medium_summary": {"type": "string"},
+                    "timeline_events": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["short_summary", "medium_summary", "timeline_events"],
+            },
+        },
+    }]
+
+    def _raw_from(response) -> str:
+        msg = response.choices[0].message
+        if msg.tool_calls:
+            return msg.tool_calls[0].function.arguments
+        return msg.content or ""
 
     def node(state: ChapterGraphState) -> dict:
         if not state.chapter_prose:
@@ -103,62 +118,22 @@ def make_chapter_summarizer_node(
         template = get_template("chapter_summarizer", state.story_id, db_path)
         prompt = build_summarizer_prompt(state, template=template)
 
-        for attempt in range(3):
-            try:
-                response = _client().chat.completions.create(
-                    model=model,
-                    max_tokens=1024,
-                    timeout=300,
-                    tools=[{
-                        "type": "function",
-                        "function": {
-                            "name": "chapter_summary",
-                            "description": "Structured summary of a novel chapter.",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "short_summary": {"type": "string"},
-                                    "medium_summary": {"type": "string"},
-                                    "timeline_events": {
-                                        "type": "array",
-                                        "items": {"type": "string"},
-                                    },
-                                },
-                                "required": ["short_summary", "medium_summary", "timeline_events"],
-                            },
-                        },
-                    }],
-                    tool_choice={"type": "function", "function": {"name": "chapter_summary"}},
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                break
-            except Exception as e:
-                if attempt == 2:
-                    raise
-                wait = 2 ** attempt * 3
-                print(f"  Ollama error — retrying in {wait}s (attempt {attempt + 1}/3): {e}")
-                time.sleep(wait)
-
-        msg = response.choices[0].message
-        if msg.tool_calls:
-            raw = msg.tool_calls[0].function.arguments
-        else:
-            raw = msg.content or ""
+        response = chat(
+            prompt, model=model, max_tokens=1024, timeout=300,
+            tools=_SUMMARY_TOOL,
+            tool_choice={"type": "function", "function": {"name": "chapter_summary"}},
+            client=ollama_client, label="Chapter summarizer",
+        )
+        raw = _raw_from(response)
 
         # If we got nothing, retry without tool_choice (model ignored it)
         if not raw.strip():
             print("  [summarizer] Empty response — retrying without tool_choice...")
-            retry = _client().chat.completions.create(
-                model=model,
-                max_tokens=1024,
-                timeout=300,
-                messages=[{"role": "user", "content": prompt}],
+            retry = chat(
+                prompt, model=model, max_tokens=1024, timeout=300,
+                client=ollama_client, label="Chapter summarizer",
             )
-            retry_msg = retry.choices[0].message
-            if retry_msg.tool_calls:
-                raw = retry_msg.tool_calls[0].function.arguments
-            else:
-                raw = retry_msg.content or ""
+            raw = _raw_from(retry)
 
         summary = _parse_summary(raw, state.chapter_number)
         return {"chapter_summary": summary}

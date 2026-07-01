@@ -493,10 +493,10 @@ class WorldBibleTab:
     def _write_entity(self, entity_type: str, data: dict):
         import db
         import vector_store as vs
-        from embeddings import LocalEmbedder
+        from embeddings import get_default_embedder
 
         chroma = vs.get_chroma_client(self.chroma_path)
-        emb = LocalEmbedder()
+        emb = get_default_embedder()
 
         def embed(etype, eid, text, sid=None):
             vec = emb.embed(text)

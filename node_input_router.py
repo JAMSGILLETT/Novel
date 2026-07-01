@@ -24,14 +24,12 @@ Model: same local Ollama server as other nodes.
 """
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-from llm_json import parse_json_response
-from node_story_planner import OLLAMA_BASE_URL, MODEL
+from llm_client import MODEL, chat_json
 from prompt_templates import get_template
 from schema import ChapterGraphState
 from db import has_any_chapters, get_latest_chapter_number, init_db
@@ -64,34 +62,13 @@ def make_input_router_node(
 ) -> Callable[[ChapterGraphState], dict]:
     """Returns the Node 1 function. Pass ollama_client in tests to inject a fake."""
 
-    def _client():
-        if ollama_client is not None:
-            return ollama_client
-        from openai import OpenAI
-        return OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
-
     def classify_continuation_or_injection(user_input: str, story_id: str) -> InputClassification:
         template = get_template("input_router_classification", story_id, db_path)
         prompt = build_classification_prompt(user_input, template=template)
-        for attempt in range(3):
-            try:
-                response = _client().chat.completions.create(
-                    model=model,
-                    max_tokens=256,
-                    timeout=120,
-                    response_format={"type": "json_object"},
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                break
-            except Exception as e:
-                if attempt == 2:
-                    raise
-                wait = 2 ** attempt * 3
-                print(f"  Ollama error — retrying in {wait}s (attempt {attempt + 1}/3): {e}")
-                time.sleep(wait)
-
-        raw_content = response.choices[0].message.content or ""
-        data = parse_json_response(raw_content, error_label="Input router")
+        data = chat_json(
+            prompt, model=model, max_tokens=256, timeout=120,
+            client=ollama_client, label="Input router",
+        )
         data.setdefault("mode", "continuation")
         data.setdefault("reasoning", "")
         return InputClassification.model_validate(data)

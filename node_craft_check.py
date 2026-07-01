@@ -20,11 +20,9 @@ applied in the parser.
 """
 from __future__ import annotations
 
-import time
 from typing import Callable, Optional
 
-from llm_json import parse_json_response
-from node_story_planner import OLLAMA_BASE_URL, MODEL
+from llm_client import MODEL, chat_json
 from schema import CraftCheckResult, ChapterGraphState, ContextPack, StoryPlan
 
 
@@ -87,9 +85,7 @@ _ISSUE_DEFAULTS: dict = {
 }
 
 
-def _parse_check_result(raw_content: str) -> CraftCheckResult:
-    data = parse_json_response(raw_content, error_label="Craft check")
-
+def _parse_check_result(data: dict) -> CraftCheckResult:
     for key, default in _RESULT_DEFAULTS.items():
         if key not in data:
             data[key] = default
@@ -115,44 +111,15 @@ def make_craft_check_node(
     db_path=None,
 ) -> Callable[[ChapterGraphState], CraftCheckResult]:
 
-    def _client():
-        if ollama_client is not None:
-            return ollama_client
-        from openai import OpenAI
-        return OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
-
     def check(state: ChapterGraphState) -> CraftCheckResult:
         from prompt_templates import get_template
         template = get_template("craft_check", state.story_id, db_path)
         prompt = build_craft_check_prompt(state, template=template)
-        for attempt in range(3):
-            try:
-                try:
-                    response = _client().chat.completions.create(
-                        model=model,
-                        max_tokens=2048,
-                        timeout=600,
-                        response_format={"type": "json_object"},
-                        messages=[{"role": "user", "content": prompt}],
-                    )
-                except Exception:
-                    # Fallback: some Ollama models reject response_format
-                    response = _client().chat.completions.create(
-                        model=model,
-                        max_tokens=2048,
-                        timeout=600,
-                        messages=[{"role": "user", "content": prompt}],
-                    )
-                break
-            except Exception as e:
-                if attempt == 2:
-                    raise
-                wait = 2 ** attempt * 3
-                print(f"  Ollama error — retrying in {wait}s (attempt {attempt + 1}/3): {e}")
-                time.sleep(wait)
-
-        raw_content = response.choices[0].message.content or ""
-        return _parse_check_result(raw_content)
+        data = chat_json(
+            prompt, model=model, max_tokens=2048, client=ollama_client,
+            label="Craft check", response_format_fallback=True,
+        )
+        return _parse_check_result(data)
 
     return check
 

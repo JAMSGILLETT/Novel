@@ -30,13 +30,13 @@ Model: same local Ollama server as other nodes.
 from __future__ import annotations
 
 import sqlite3
-import time
 from pathlib import Path
 from typing import Callable, Optional
 
 import db
+from llm_client import MODEL, chat
 from llm_json import parse_json_response
-from node_story_planner import OLLAMA_BASE_URL, MODEL, full_history_text
+from node_story_planner import full_history_text
 from prompt_templates import get_template
 from schema import (
     CharacterArcNote, ChapterGraphState, PlotlinePatch, StoryBeat, StoryOutline,
@@ -45,32 +45,12 @@ from schema import (
 OUTLINE_REVISION_INTERVAL = 15  # chapters between full LLM outline rewrites (and act-summary boundaries)
 
 
-def _client_factory(ollama_client=None):
-    def _client():
-        if ollama_client is not None:
-            return ollama_client
-        from openai import OpenAI
-        return OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
-    return _client
-
-
-def _call_llm(client_fn, model: str, prompt: str, max_tokens: int = 1536) -> str:
-    for attempt in range(3):
-        try:
-            response = client_fn().chat.completions.create(
-                model=model,
-                max_tokens=max_tokens,
-                timeout=600,
-                response_format={"type": "json_object"},
-                messages=[{"role": "user", "content": prompt}],
-            )
-            break
-        except Exception as e:
-            if attempt == 2:
-                raise
-            wait = 2 ** attempt * 3
-            print(f"  Ollama error — retrying in {wait}s (attempt {attempt + 1}/3): {e}")
-            time.sleep(wait)
+def _call_llm(model: str, prompt: str, max_tokens: int = 1536, ollama_client=None) -> str:
+    response = chat(
+        prompt, model=model, max_tokens=max_tokens, timeout=600,
+        response_format={"type": "json_object"}, client=ollama_client,
+        label="Outline manager",
+    )
     return response.choices[0].message.content or ""
 
 
@@ -147,7 +127,6 @@ def make_outline_manager_node(
 ) -> Callable[[ChapterGraphState], dict]:
     """Runs right after Node 1. Loads the existing outline, or generates one
     on cold start (the only case that costs an LLM call)."""
-    _client = _client_factory(ollama_client)
 
     def node(state: ChapterGraphState) -> dict:
         existing = db.get_story_outline(state.story_id, db_path)
@@ -160,7 +139,7 @@ def make_outline_manager_node(
 
         template = get_template("outline_init", state.story_id, db_path)
         prompt = _build_init_prompt(state.user_input, world_rules, world_lore, characters, template=template)
-        raw_content = _call_llm(_client, model, prompt)
+        raw_content = _call_llm(model, prompt, ollama_client=ollama_client)
         outline = _parse_init_outline(raw_content, state.story_id)
         db.upsert_story_outline(outline, db_path)
         return {"story_outline": outline}
@@ -323,11 +302,10 @@ def maybe_revise_outline(
 
     print_fn(f"  Outline due for revision (every {OUTLINE_REVISION_INTERVAL} chapters) — rewriting...")
     characters = db.get_all_characters(state.story_id, db_path)
-    _client = _client_factory(ollama_client)
 
     template = get_template("outline_revision", state.story_id, db_path)
     prompt = _build_revision_prompt(state, outline, characters, template=template)
-    raw_content = _call_llm(_client, model, prompt)
+    raw_content = _call_llm(model, prompt, ollama_client=ollama_client)
     revised = _parse_revision(raw_content, state.story_id, state.chapter_number, outline.version)
     db.upsert_story_outline(revised, db_path)
     print_fn(f"  Outline revised to v{revised.version} ({len(revised.beats)} beats, {len(revised.character_arcs)} arcs)")

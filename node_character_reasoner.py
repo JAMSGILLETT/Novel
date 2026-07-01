@@ -37,13 +37,12 @@ can pass a fake client and db_path without touching production singletons.
 """
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Callable, Optional
 
 import db
-from llm_json import parse_json_response
-from node_story_planner import OLLAMA_BASE_URL, MODEL, full_history_text
+from llm_client import MODEL, chat_json
+from node_story_planner import full_history_text
 from schema import (
     Character, CharacterConstraint, CharacterReasoning,
     ChapterGraphState, ContextPack, StoryPlan,
@@ -180,12 +179,6 @@ def make_character_reasoner_node(
     db_path: Optional[Path] = None,
 ) -> Callable[[ChapterGraphState], dict]:
 
-    def _client():
-        if ollama_client is not None:
-            return ollama_client
-        from openai import OpenAI
-        return OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
-
     def _reason_one(
         character: Character, constraint: CharacterConstraint,
         plan: StoryPlan, pack: ContextPack,
@@ -198,28 +191,11 @@ def make_character_reasoner_node(
         prompt = _build_character_prompt(
             character, constraint, plan, pack, history_text, prior_actions, template=template
         )
-        client = _client()
 
-        full_prompt = prompt + _REASONING_TEMPLATE
-        for attempt in range(3):
-            try:
-                response = client.chat.completions.create(
-                    model=model,
-                    max_tokens=1024,
-                    timeout=600,
-                    response_format={"type": "json_object"},
-                    messages=[{"role": "user", "content": full_prompt}],
-                )
-                break
-            except Exception as e:
-                if attempt == 2:
-                    raise
-                wait = 2 ** attempt * 3
-                print(f"  Ollama error for {character.name} — retrying in {wait}s: {e}")
-                time.sleep(wait)
-
-        raw_content = response.choices[0].message.content or ""
-        data = parse_json_response(raw_content, error_label=f"Character reasoner ({character.name})")
+        data = chat_json(
+            prompt + _REASONING_TEMPLATE, model=model, max_tokens=1024,
+            client=ollama_client, label=f"Character reasoner ({character.name})",
+        )
         for key, default in _REASONING_DEFAULTS.items():
             if key not in data:
                 data[key] = default

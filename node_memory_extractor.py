@@ -18,11 +18,10 @@ writes anything to the DB.
 """
 from __future__ import annotations
 
-import time
 from typing import Callable, Optional
 
+from llm_client import MODEL, chat_text
 from llm_json import extract_json_block, parse_json_response
-from node_story_planner import OLLAMA_BASE_URL, MODEL
 from schema import (
     Character, ChapterGraphState, ChapterSummary, ContextPack,
     CharacterPatch, PlotlinePatch, LocationPatch, POVPatch,
@@ -46,23 +45,11 @@ def _unwrap_envelope(data: dict | list) -> dict | list:
     return data
 
 
-def _call_llm(client, model: str, prompt: str, max_tokens: int = 1024) -> str:
-    for attempt in range(3):
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                max_tokens=max_tokens,
-                timeout=300,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            break
-        except Exception as e:
-            if attempt == 2:
-                raise
-            wait = 2 ** attempt * 3
-            print(f"  Ollama error — retrying in {wait}s (attempt {attempt + 1}/3): {e}")
-            time.sleep(wait)
-    return (response.choices[0].message.content or "").strip()
+def _call_llm(model: str, ollama_client, prompt: str, max_tokens: int = 1024) -> str:
+    return chat_text(
+        prompt, model=model, max_tokens=max_tokens, timeout=300,
+        client=ollama_client, label="Memory extractor",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -375,12 +362,6 @@ def make_memory_extractor_node(
     db_path=None,
 ) -> Callable[[ChapterGraphState], dict]:
 
-    def _client():
-        if ollama_client is not None:
-            return ollama_client
-        from openai import OpenAI
-        return OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
-
     def node(state: ChapterGraphState) -> dict:
         if not state.chapter_prose:
             raise ValueError("chapter_prose must be set before memory extractor runs")
@@ -414,7 +395,7 @@ def make_memory_extractor_node(
         for c in pack.active_characters:
             print(f"  Extracting memory: {c.name}...")
             try:
-                raw = _call_llm(_client(), model, _character_prompt(c, prose, summary, template=tpl_character))
+                raw = _call_llm(model, ollama_client, _character_prompt(c, prose, summary, template=tpl_character))
                 data = _unwrap_envelope(_parse_json(raw))
                 patch = _to_patch(data, CharacterPatch)
                 if patch:
@@ -431,7 +412,7 @@ def make_memory_extractor_node(
         for p in pack.active_plotlines:
             print(f"  Extracting memory: plotline '{p.name}'...")
             try:
-                raw = _call_llm(_client(), model, _plotline_prompt(p, prose, summary, template=tpl_plotline))
+                raw = _call_llm(model, ollama_client, _plotline_prompt(p, prose, summary, template=tpl_plotline))
                 data = _unwrap_envelope(_parse_json(raw))
                 patch = _to_patch(data, PlotlinePatch)
                 if patch:
@@ -448,7 +429,7 @@ def make_memory_extractor_node(
         for loc in pack.nearby_locations:
             print(f"  Extracting memory: location '{loc.name}'...")
             try:
-                raw = _call_llm(_client(), model, _location_prompt(loc, prose, summary, template=tpl_location))
+                raw = _call_llm(model, ollama_client, _location_prompt(loc, prose, summary, template=tpl_location))
                 data = _unwrap_envelope(_parse_json(raw))
                 patch = _to_patch(data, LocationPatch)
                 if patch:
@@ -465,7 +446,7 @@ def make_memory_extractor_node(
         if pack.pov_state:
             print(f"  Extracting memory: POV state...")
             try:
-                raw = _call_llm(_client(), model, _pov_prompt(pack.pov_state, pack, prose, summary, template=tpl_pov))
+                raw = _call_llm(model, ollama_client, _pov_prompt(pack.pov_state, pack, prose, summary, template=tpl_pov))
                 data = _unwrap_envelope(_parse_json(raw))
                 patch = _to_patch(data, POVPatch)
                 if patch and _has_changes(patch, exclude=("entity_type", "source")):
@@ -497,7 +478,7 @@ def make_memory_extractor_node(
         existing_lore_titles = [l.title for l in _db_module.get_all_world_lore(_db)]
 
         try:
-            raw = _call_llm(_client(), model, _new_characters_prompt(prose, existing_char_names, template=tpl_new_characters))
+            raw = _call_llm(model, ollama_client, _new_characters_prompt(prose, existing_char_names, template=tpl_new_characters))
             for item in _parse_new_entities(raw):
                 if not isinstance(item, dict) or not item.get("name"):
                     continue
@@ -519,7 +500,7 @@ def make_memory_extractor_node(
             print(f"    [warn] New character scan failed: {e}")
 
         try:
-            raw = _call_llm(_client(), model, _new_locations_prompt(prose, existing_loc_names, template=tpl_new_locations))
+            raw = _call_llm(model, ollama_client, _new_locations_prompt(prose, existing_loc_names, template=tpl_new_locations))
             for item in _parse_new_entities(raw):
                 if not isinstance(item, dict) or not item.get("name"):
                     continue
@@ -540,7 +521,7 @@ def make_memory_extractor_node(
             print(f"    [warn] New location scan failed: {e}")
 
         try:
-            raw = _call_llm(_client(), model, _new_plotlines_prompt(prose, existing_plot_names, template=tpl_new_plotlines))
+            raw = _call_llm(model, ollama_client, _new_plotlines_prompt(prose, existing_plot_names, template=tpl_new_plotlines))
             for item in _parse_new_entities(raw):
                 if not isinstance(item, dict) or not item.get("name"):
                     continue
@@ -560,7 +541,7 @@ def make_memory_extractor_node(
             print(f"    [warn] New plotline scan failed: {e}")
 
         try:
-            raw = _call_llm(_client(), model, _new_world_rules_prompt(prose, existing_rule_titles, template=tpl_new_world_rules))
+            raw = _call_llm(model, ollama_client, _new_world_rules_prompt(prose, existing_rule_titles, template=tpl_new_world_rules))
             for item in _parse_new_entities(raw):
                 if not isinstance(item, dict) or not item.get("title"):
                     continue
@@ -578,7 +559,7 @@ def make_memory_extractor_node(
             print(f"    [warn] New world rule scan failed: {e}")
 
         try:
-            raw = _call_llm(_client(), model, _new_world_lore_prompt(prose, existing_lore_titles, template=tpl_new_world_lore))
+            raw = _call_llm(model, ollama_client, _new_world_lore_prompt(prose, existing_lore_titles, template=tpl_new_world_lore))
             for item in _parse_new_entities(raw):
                 if not isinstance(item, dict) or not item.get("title"):
                     continue

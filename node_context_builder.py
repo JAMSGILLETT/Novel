@@ -68,6 +68,15 @@ def make_context_builder_node(
         return chroma_client if chroma_client is not None else vs.get_chroma_client()
 
     def node(state: ChapterGraphState) -> dict:
+        # One connection for this node's dozen-plus reads instead of opening and
+        # closing a fresh one per getter. Closed in the finally below.
+        conn = db.get_connection(db_path)
+        try:
+            return _build_pack(state, conn)
+        finally:
+            conn.close()
+
+    def _build_pack(state: ChapterGraphState, conn) -> dict:
         story_id = state.story_id
         cfg = state.retrieval_config
         client = _client()
@@ -76,10 +85,10 @@ def make_context_builder_node(
         # MANDATORY PASS                                                       #
         # ------------------------------------------------------------------ #
 
-        all_world_rules: List[WorldRule] = db.get_all_world_rules(db_path)
-        all_world_lore: List[WorldLore] = db.get_all_world_lore(db_path)
+        all_world_rules: List[WorldRule] = db.get_all_world_rules(db_path, conn=conn)
+        all_world_lore: List[WorldLore] = db.get_all_world_lore(db_path, conn=conn)
 
-        all_plotlines = db.get_all_plotlines(story_id, db_path)
+        all_plotlines = db.get_all_plotlines(story_id, db_path, conn=conn)
         active_plotlines: List[Plotline] = [
             p for p in all_plotlines if p.status == "active"
         ]
@@ -91,12 +100,12 @@ def make_context_builder_node(
             if state.chapter_number - p.last_touched_chapter >= STALE_PLOTLINE_THRESHOLD
         ]
 
-        pov = db.get_pov_state(story_id, db_path)
+        pov = db.get_pov_state(story_id, db_path, conn=conn)
 
         mandatory_characters: List[Character] = []
         mandatory_char_ids: Set[str] = set()
         if pov and pov.pov_character_id:
-            c = db.get_character_by_id(pov.pov_character_id, story_id, db_path)
+            c = db.get_character_by_id(pov.pov_character_id, story_id, db_path, conn=conn)
             if c:
                 mandatory_characters.append(c)
                 mandatory_char_ids.add(pov.pov_character_id)
@@ -104,15 +113,15 @@ def make_context_builder_node(
         mandatory_locations: List[Location] = []
         mandatory_loc_ids: Set[str] = set()
         if pov and pov.location_id:
-            loc = db.get_location_by_id(pov.location_id, story_id, db_path)
+            loc = db.get_location_by_id(pov.location_id, story_id, db_path, conn=conn)
             if loc:
                 mandatory_locations.append(loc)
                 mandatory_loc_ids.add(loc.id)
 
-        last_summary = db.get_last_chapter_summary(story_id, state.chapter_number, db_path)
+        last_summary = db.get_last_chapter_summary(story_id, state.chapter_number, db_path, conn=conn)
 
         # Character roster — all characters, lightweight
-        all_characters = db.get_all_characters(story_id, db_path)
+        all_characters = db.get_all_characters(story_id, db_path, conn=conn)
         roster: List[CharacterRosterEntry] = [
             CharacterRosterEntry(
                 id=c.id,
@@ -152,15 +161,15 @@ def make_context_builder_node(
 
         vector_characters: List[Character] = _fetch_new(
             char_hits, mandatory_char_ids,
-            lambda eid: db.get_character_by_id(eid, story_id, db_path),
+            lambda eid: db.get_character_by_id(eid, story_id, db_path, conn=conn),
         )
         vector_plotlines: List[Plotline] = _fetch_new(
             plot_hits, mandatory_plot_ids,
-            lambda eid: db.get_plotline_by_id(eid, story_id, db_path),
+            lambda eid: db.get_plotline_by_id(eid, story_id, db_path, conn=conn),
         )
         vector_locations: List[Location] = _fetch_new(
             loc_hits, mandatory_loc_ids,
-            lambda eid: db.get_location_by_id(eid, story_id, db_path),
+            lambda eid: db.get_location_by_id(eid, story_id, db_path, conn=conn),
         )
 
         # NAME-MATCH PASS: if a character's name appears literally in the user
@@ -193,13 +202,13 @@ def make_context_builder_node(
             + [w.id for w in world_lore]
         )
         injected_ids: Set[str] = set(all_found_ids)
-        canon_rules = db.get_canon_rules_triggered_by(story_id, all_found_ids, db_path)
+        canon_rules = db.get_canon_rules_triggered_by(story_id, all_found_ids, db_path, conn=conn)
 
         dep_hits: List[DependencyGraphHit] = []
         for rule in canon_rules:
             if rule.inject_entity_id in injected_ids:
                 continue
-            entity = _fetch_by_type(rule, story_id, db_path)
+            entity = _fetch_by_type(rule, story_id, db_path, conn=conn)
             if entity is None:
                 continue
             injected_ids.add(rule.inject_entity_id)
@@ -262,19 +271,19 @@ def _fetch_new(
     return out
 
 
-def _fetch_by_type(rule: CanonRule, story_id: str, db_path: Optional[Path]):
+def _fetch_by_type(rule: CanonRule, story_id: str, db_path: Optional[Path], conn=None):
     t = rule.inject_entity_type
     eid = rule.inject_entity_id
     if t == "character":
-        return db.get_character_by_id(eid, story_id, db_path)
+        return db.get_character_by_id(eid, story_id, db_path, conn=conn)
     if t == "plotline":
-        return db.get_plotline_by_id(eid, story_id, db_path)
+        return db.get_plotline_by_id(eid, story_id, db_path, conn=conn)
     if t == "location":
-        return db.get_location_by_id(eid, story_id, db_path)
+        return db.get_location_by_id(eid, story_id, db_path, conn=conn)
     if t == "world_rule":
-        return db.get_world_rule_by_id(eid, db_path)
+        return db.get_world_rule_by_id(eid, db_path, conn=conn)
     if t == "world_lore":
-        return db.get_world_lore_by_id(eid, db_path)
+        return db.get_world_lore_by_id(eid, db_path, conn=conn)
     return None
 
 

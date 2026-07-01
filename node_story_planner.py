@@ -25,21 +25,12 @@ Requires:
 """
 from __future__ import annotations
 
-import os
-import time
 from typing import Callable, Optional
 
-from llm_json import parse_json_response
+from llm_client import MODEL, chat_json
 from schema import (
     CharacterRosterEntry, ContextPack, ChapterGraphState, StoryPlan,
 )
-
-DEFAULT_MODEL = "qwen2.5:14b-instruct-q4_K_M"
-OLLAMA_BASE_URL = "http://localhost:11434/v1"
-
-# Override the model at runtime without touching code:
-#   set NOVELGEN_MODEL=llama3.3:70b
-MODEL = os.environ.get("NOVELGEN_MODEL", DEFAULT_MODEL)
 
 
 # ---------------------------------------------------------------------------
@@ -254,14 +245,6 @@ def build_planner_prompt(state: ChapterGraphState, template: Optional[str] = Non
 # Node
 # ---------------------------------------------------------------------------
 
-def _make_ollama_client():
-    from openai import OpenAI
-    return OpenAI(
-        base_url=OLLAMA_BASE_URL,
-        api_key="ollama",  # Ollama ignores this but the openai client requires a non-empty value
-    )
-
-
 def make_story_planner_node(
     model: str = MODEL,
     ollama_client=None,
@@ -269,11 +252,8 @@ def make_story_planner_node(
 ) -> Callable[[ChapterGraphState], dict]:
     """
     Returns a LangGraph node. Pass ollama_client in tests to inject a mock.
-    In production the real OpenAI client pointed at the local Ollama server is built lazily.
+    In production the shared llm_client (pointed at the local Ollama server) is used.
     """
-
-    def _client():
-        return ollama_client if ollama_client is not None else _make_ollama_client()
 
     def node(state: ChapterGraphState) -> dict:
         from prompt_templates import get_template
@@ -282,36 +262,13 @@ def make_story_planner_node(
 
         # Append a JSON template to the prompt so the model knows exactly what
         # fields are required, then force JSON output via response_format.
-        full_prompt = prompt + _JSON_TEMPLATE
-        for attempt in range(3):
-            try:
-                response = _client().chat.completions.create(
-                    model=model,
-                    max_tokens=4096,
-                    timeout=600,
-                    response_format={"type": "json_object"},
-                    messages=[{"role": "user", "content": full_prompt}],
-                )
-                break
-            except Exception as e:
-                if attempt == 2:
-                    raise
-                wait = 2 ** attempt * 3
-                print(f"  Ollama error — retrying in {wait}s (attempt {attempt + 1}/3): {e}")
-                time.sleep(wait)
-
-        plan = _extract_plan(response)
-        return {"story_plan": plan}
+        data = chat_json(
+            prompt + _JSON_TEMPLATE, model=model, max_tokens=4096,
+            client=ollama_client, label="Story planner",
+        )
+        return {"story_plan": _parse_plan_json(data)}
 
     return node
-
-
-def _extract_plan(response) -> StoryPlan:
-    """Extract StoryPlan from the response (response_format=json_object path)."""
-    msg = response.choices[0].message
-    raw_content = msg.content or ""
-    data = parse_json_response(raw_content, error_label="Story planner")
-    return _parse_plan_json(data)
 
 
 def _parse_plan_json(data: dict) -> StoryPlan:

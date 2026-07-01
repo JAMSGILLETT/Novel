@@ -25,7 +25,7 @@ from typing import Callable, Optional
 
 import db
 import vector_store as vs
-from embeddings import LocalEmbedder
+from embeddings import get_default_embedder
 from schema import (
     Character, ChapterGraphState, ChapterSummary, Location, Plotline, POVState,
     CharacterPatch, PlotlinePatch, LocationPatch, POVPatch,
@@ -185,7 +185,7 @@ def make_persistence_node(
         raise RuntimeError("persistence node requires a chroma_client — pass one to make_persistence_node()")
 
     def _embedder():
-        return embedder if embedder is not None else LocalEmbedder()
+        return embedder if embedder is not None else get_default_embedder()
 
     def node(state: ChapterGraphState) -> dict:
         _db = db_path

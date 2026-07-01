@@ -1,0 +1,20 @@
+# NovelGen dependencies
+#
+# LLM access (local Ollama via its OpenAI-compatible API on localhost:11434)
+openai>=1.0
+
+# Structured-output resilience for small local models
+json-repair>=0.25
+
+# Data models / validation
+pydantic>=2.0
+
+# Vector store + embeddings (retrieval / context builder)
+chromadb==0.4.24
+sentence-transformers>=2.2
+
+# GUI
+customtkinter>=5.2
+
+# Testing
+pytest>=7.0

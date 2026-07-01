@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -27,6 +28,13 @@ BACKUP_RETENTION = 10  # keep the last N timestamped story.db backups
 def _elapsed(t0: float) -> str:
     secs = time.time() - t0
     return f"{secs:.1f}s" if secs < 60 else f"{int(secs//60)}m {int(secs%60)}s"
+
+
+def _section(p, title: str) -> None:
+    """Prints a node/stage banner — collapses the repeated 60-char rule blocks."""
+    p(f"\n{'='*60}")
+    p(title)
+    p(f"{'='*60}")
 
 
 def _backup_database(db_path: Path, chapter_number: int, print_fn=print) -> None:
@@ -62,12 +70,17 @@ def _run_revision_loop(
     max_retries: int,
     label: str,
     print_fn=print,
+    first_result=None,
 ):
     """Runs check_fn(state) repeatedly, asking writer_node to revise the prose
     on failure, up to max_retries times. Works for both CanonCheckResult
     (.violations) and CraftCheckResult (.issues) — pipeline.py owns this loop
     for both checks so neither check node has to privately couple itself to
     the writer.
+
+    first_result: a pre-computed check result for attempt 1 (used when the first
+    pass was already run concurrently upstream, so it isn't re-run here). Only
+    valid when it was computed against the current prose.
 
     Returns (state_with_revised_prose, result, attempts, flagged: bool).
     """
@@ -78,7 +91,10 @@ def _run_revision_loop(
     while True:
         attempts += 1
         p(f"  {label} check attempt {attempts}/{max_retries + 1}...")
-        result = check_fn(current_state)
+        if attempts == 1 and first_result is not None:
+            result = first_result
+        else:
+            result = check_fn(current_state)
         problems = getattr(result, "violations", None)
         if problems is None:
             problems = getattr(result, "issues", [])
@@ -140,8 +156,7 @@ def _update_book_summary(
     Efficiently update the running novel summary by feeding the LLM only the
     existing summary + new chapter summary — never re-reads all prose.
     """
-    from openai import OpenAI
-    from node_story_planner import OLLAMA_BASE_URL
+    from llm_client import chat_text
     from prompt_templates import get_template
 
     events_text = "\n".join(f"  • {e}" for e in chapter_summary.timeline_events)
@@ -162,15 +177,8 @@ def _update_book_summary(
             timeline_events=events_text,
         )
 
-    client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
     try:
-        response = client.chat.completions.create(
-            model=model,
-            max_tokens=700,
-            timeout=300,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        result = (response.choices[0].message.content or "").strip()
+        result = chat_text(prompt, model=model, max_tokens=700, timeout=300, label="Book summary")
         if result:
             print_fn(f"  Book summary updated ({len(result.split())} words)")
             return result
@@ -198,25 +206,15 @@ def _compress_to_act_summary(
     """One LLM call: compress a rolling summary into a permanent, compact act
     summary. This is never re-compressed again, so early acts don't get
     crushed the way a single ever-growing rolling summary eventually would."""
-    from openai import OpenAI
-    from node_story_planner import OLLAMA_BASE_URL
-    from llm_json import parse_json_response
+    from llm_client import chat_json
     from prompt_templates import get_template
 
     tpl = get_template("act_summary_compression", story_id, db_path)
     prompt = tpl.format(rolling_summary=rolling_summary) + _ACT_SUMMARY_OUTPUT_FORMAT
 
-    client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
     try:
-        response = client.chat.completions.create(
-            model=model,
-            max_tokens=700,
-            timeout=300,
-            response_format={"type": "json_object"},
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw_content = response.choices[0].message.content or ""
-        data = parse_json_response(raw_content, error_label="Act summary compression")
+        data = chat_json(prompt, model=model, max_tokens=700, timeout=300,
+                         label="Act summary compression")
         summary = (data.get("summary") or "").strip()
         key_events = data.get("key_events") or []
         if summary:
@@ -294,7 +292,8 @@ def run_chapter(
     from node_input_router import make_input_router_node
     from node_outline_manager import make_outline_manager_node, maybe_revise_outline
     from node_context_builder import make_context_builder_node, STALE_PLOTLINE_THRESHOLD
-    from node_story_planner import make_story_planner_node, MODEL as _MODEL
+    from node_story_planner import make_story_planner_node
+    from llm_client import MODEL as _MODEL
     from node_character_reasoner import make_character_reasoner_node
     from node_story_writer import make_story_writer_node
     from node_canon_check import make_canon_check_node
@@ -322,9 +321,7 @@ def run_chapter(
     chroma_client = vs.get_chroma_client(chroma_path)
 
     # ── Node 1: Input Router ──────────────────────────────────────
-    p(f"\n{'='*60}")
-    p("NODE 1 — INPUT ROUTER")
-    p(f"{'='*60}")
+    _section(p, "NODE 1 — INPUT ROUTER")
     t0 = time.time()
     result = make_input_router_node(db_path=db_path)(state)
     state = state.model_copy(update=result)
@@ -335,9 +332,7 @@ def run_chapter(
     _backup_database(db_path, state.chapter_number, print_fn=p)
 
     # ── Outline Manager (load, or generate on cold start) ─────────
-    p(f"\n{'='*60}")
-    p("OUTLINE MANAGER")
-    p(f"{'='*60}")
+    _section(p, "OUTLINE MANAGER")
     t0 = time.time()
     outline_node = make_outline_manager_node(db_path=db_path)
     result = outline_node(state)
@@ -348,9 +343,7 @@ def run_chapter(
     p(f"  Done in {_elapsed(t0)}")
 
     # ── Node 2: Context Builder ───────────────────────────────────
-    p(f"\n{'='*60}")
-    p("NODE 2 — CONTEXT BUILDER")
-    p(f"{'='*60}")
+    _section(p, "NODE 2 — CONTEXT BUILDER")
     t0 = time.time()
     context_node = make_context_builder_node(chroma_client=chroma_client, db_path=db_path)
     result = context_node(state)
@@ -365,9 +358,7 @@ def run_chapter(
     p(f"  Done in {_elapsed(t0)}")
 
     # ── Node 3: Story Planner ─────────────────────────────────────
-    p(f"\n{'='*60}")
-    p(f"NODE 3 — STORY PLANNER  [{_MODEL}]")
-    p(f"{'='*60}")
+    _section(p, f"NODE 3 — STORY PLANNER  [{_MODEL}]")
     t0 = time.time()
     result = make_story_planner_node(db_path=db_path)(state)
     state = state.model_copy(update=result)
@@ -378,9 +369,7 @@ def run_chapter(
     p(f"  Done in {_elapsed(t0)}")
 
     # ── Node 4: Character Reasoner ────────────────────────────────
-    p(f"\n{'='*60}")
-    p(f"NODE 4 — CHARACTER REASONER  [{_MODEL}]")
-    p(f"{'='*60}")
+    _section(p, f"NODE 4 — CHARACTER REASONER  [{_MODEL}]")
     t0 = time.time()
     result = make_character_reasoner_node(db_path=db_path)(state)
     state = state.model_copy(update={
@@ -392,9 +381,7 @@ def run_chapter(
     p(f"  Done in {_elapsed(t0)}")
 
     # ── Node 5: Story Writer ──────────────────────────────────────
-    p(f"\n{'='*60}")
-    p(f"NODE 5 — STORY WRITER  [{_MODEL}]")
-    p(f"{'='*60}")
+    _section(p, f"NODE 5 — STORY WRITER  [{_MODEL}]")
     t0 = time.time()
     writer_node = make_story_writer_node(db_path=db_path)
     result = writer_node(state)
@@ -403,14 +390,25 @@ def run_chapter(
     p(f"  {word_count} words written")
     p(f"  Done in {_elapsed(t0)}")
 
-    # ── Node 6: Canon Check ───────────────────────────────────────
-    p(f"\n{'='*60}")
-    p(f"NODE 6 — CANON CHECK  [{_MODEL}]")
-    p(f"{'='*60}")
+    # ── Node 6 & Craft: Canon + Craft checks ──────────────────────
+    # The two checks read the same prose and are independent, so their first
+    # pass runs concurrently (two LLM calls at once). If canon then has to
+    # revise the prose, the craft first-pass is stale and is discarded so craft
+    # still evaluates the canon-approved text (preserving the original ordering).
+    _section(p, f"NODE 6 — CANON CHECK  [{_MODEL}]")
     t0 = time.time()
     canon_check = make_canon_check_node(db_path=db_path)
+    craft_check = make_craft_check_node(db_path=db_path)
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut_canon = ex.submit(canon_check, state)
+        fut_craft = ex.submit(craft_check, state)
+        canon_first = fut_canon.result()
+        craft_first = fut_craft.result()
+
     state, canon_result, canon_attempts, canon_flagged = _run_revision_loop(
-        state, canon_check, writer_node, MAX_CANON_CHECK_RETRIES, "Canon", print_fn=p,
+        state, canon_check, writer_node, MAX_CANON_CHECK_RETRIES, "Canon",
+        print_fn=p, first_result=canon_first,
     )
     state = state.model_copy(update={
         "canon_check_result": canon_result,
@@ -427,13 +425,14 @@ def run_chapter(
     p(f"  Done in {_elapsed(t0)}")
 
     # ── Craft Check ────────────────────────────────────────────────
-    p(f"\n{'='*60}")
-    p(f"CRAFT CHECK  [{_MODEL}]")
-    p(f"{'='*60}")
+    _section(p, f"CRAFT CHECK  [{_MODEL}]")
     t0 = time.time()
-    craft_check = make_craft_check_node(db_path=db_path)
+    # The concurrent craft first-pass is only valid if canon left prose untouched
+    # (i.e. canon passed on its first attempt without a rewrite).
+    craft_seed = craft_first if canon_attempts == 1 else None
     state, craft_result, craft_attempts, craft_flagged = _run_revision_loop(
-        state, craft_check, writer_node, MAX_CRAFT_CHECK_RETRIES, "Craft", print_fn=p,
+        state, craft_check, writer_node, MAX_CRAFT_CHECK_RETRIES, "Craft",
+        print_fn=p, first_result=craft_seed,
     )
     state = state.model_copy(update={
         "craft_check_result": craft_result,
@@ -450,9 +449,7 @@ def run_chapter(
     p(f"  Done in {_elapsed(t0)}")
 
     # ── Node 7: Chapter Summarizer ────────────────────────────────
-    p(f"\n{'='*60}")
-    p(f"NODE 7 — CHAPTER SUMMARIZER  [{_MODEL}]")
-    p(f"{'='*60}")
+    _section(p, f"NODE 7 — CHAPTER SUMMARIZER  [{_MODEL}]")
     t0 = time.time()
     result = make_chapter_summarizer_node(db_path=db_path)(state)
     state = state.model_copy(update=result)
@@ -460,9 +457,7 @@ def run_chapter(
     p(f"  Done in {_elapsed(t0)}")
 
     # ── Hierarchical summary update (rolling + permanent act summaries) ──
-    p(f"\n{'='*60}")
-    p("BOOK SUMMARY UPDATE")
-    p(f"{'='*60}")
+    _section(p, "BOOK SUMMARY UPDATE")
     t0 = time.time()
     new_book_summary, new_act_summaries = _update_hierarchical_summary(
         state, story_id=story_id, db_path=db_path, model=_MODEL, print_fn=p,
@@ -472,9 +467,7 @@ def run_chapter(
     p(f"  Done in {_elapsed(t0)}")
 
     # ── Node 8: Memory Extractor ──────────────────────────────────
-    p(f"\n{'='*60}")
-    p(f"NODE 8 — MEMORY EXTRACTOR  [{_MODEL}]")
-    p(f"{'='*60}")
+    _section(p, f"NODE 8 — MEMORY EXTRACTOR  [{_MODEL}]")
     t0 = time.time()
     extractor_result = make_memory_extractor_node(db_path=db_path)(state)
     state = state.model_copy(update={
@@ -490,9 +483,7 @@ def run_chapter(
     p(f"  Done in {_elapsed(t0)}")
 
     # ── Node 9: Reconciliation ────────────────────────────────────
-    p(f"\n{'='*60}")
-    p("NODE 9 — RECONCILIATION")
-    p(f"{'='*60}")
+    _section(p, "NODE 9 — RECONCILIATION")
     t0 = time.time()
     result = make_reconciliation_node()(state)
     state = state.model_copy(update=result)
@@ -501,9 +492,7 @@ def run_chapter(
     p(f"  Done in {_elapsed(t0)}")
 
     # ── Node 10: Persistence ──────────────────────────────────────
-    p(f"\n{'='*60}")
-    p("NODE 10 — PERSISTENCE")
-    p(f"{'='*60}")
+    _section(p, "NODE 10 — PERSISTENCE")
     t0 = time.time()
     make_persistence_node(chroma_client=chroma_client, db_path=db_path)(state)
     p(f"  World state saved")
