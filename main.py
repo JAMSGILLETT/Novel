@@ -336,9 +336,13 @@ class NovelGenApp(ctk.CTk):
     def _build_settings_tab(self):
         tab = self._tabs.add("Settings")
         tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
 
-        frame = ctk.CTkFrame(tab, fg_color="transparent")
-        frame.grid(row=0, column=0, sticky="new", padx=20, pady=20)
+        # Scrollable container so the full settings column is reachable even when
+        # it's taller than the window. The backups list below is a plain frame
+        # (not its own scroll region) so the two don't fight over the wheel.
+        frame = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=20)
 
         ctk.CTkLabel(frame, text="Generation model", font=("", 15, "bold")).pack(anchor="w")
         ctk.CTkLabel(
@@ -407,10 +411,14 @@ class NovelGenApp(ctk.CTk):
             fg_color="gray30", hover_color="gray40", command=self._refresh_backups,
         ).pack(side="left", padx=(8, 0))
 
-        self._backups_frame = ctk.CTkScrollableFrame(
-            frame, width=560, height=190, label_text="Available snapshots (newest first)",
-        )
-        self._backups_frame.pack(anchor="w", fill="x", pady=(8, 0))
+        ctk.CTkLabel(
+            frame, text="Available snapshots (newest first)",
+            text_color="gray60", font=("", 11), anchor="w",
+        ).pack(anchor="w", pady=(8, 2))
+        # Plain frame — the outer settings scroll handles overflow, so this list
+        # grows naturally instead of being its own (nested) scroll region.
+        self._backups_frame = ctk.CTkFrame(frame, width=560, fg_color="transparent")
+        self._backups_frame.pack(anchor="w", fill="x")
         self._backup_rows: list = []
         self._refresh_backups()
 
