@@ -366,6 +366,29 @@ class NovelGenApp(ctk.CTk):
         )
         self._settings_status.pack(anchor="w", pady=(12, 0))
 
+        # ── Generation quality ───────────────────────────────────────────
+        ctk.CTkLabel(frame, text="Generation quality", font=("", 15, "bold")).pack(anchor="w", pady=(26, 0))
+        ctk.CTkLabel(
+            frame,
+            text=("Craft self-refine: before the canon/craft check, the model does a quick pass to "
+                  "improve its own draft's writing (pacing, tension, show-don't-tell). This usually "
+                  "means fewer expensive revision rounds and stronger prose, at the cost of one or "
+                  "two extra model calls per chapter. Continuity is never touched by this step. "
+                  "On by default; takes effect on your next chapter."),
+            text_color="gray60", font=("", 11), justify="left", wraplength=560,
+        ).pack(anchor="w", pady=(2, 8))
+
+        saved_refine = db.get_setting("self_refine", "1", DB_PATH) != "0"
+        self._self_refine_var = ctk.BooleanVar(value=saved_refine)
+        self._self_refine_var.trace_add(
+            "write",
+            lambda *_: db.set_setting("self_refine", "1" if self._self_refine_var.get() else "0", DB_PATH),
+        )
+        ctk.CTkCheckBox(
+            frame, text="Enable craft self-refine", variable=self._self_refine_var,
+            font=("", 12), checkbox_width=18, checkbox_height=18,
+        ).pack(anchor="w")
+
         # ── Backups ──────────────────────────────────────────────────────
         ctk.CTkLabel(frame, text="Backups", font=("", 15, "bold")).pack(anchor="w", pady=(26, 0))
         ctk.CTkLabel(

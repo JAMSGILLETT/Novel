@@ -38,8 +38,22 @@ _CLEAN_SENTINEL = "NO_CHANGES"
 _MIN_CHANGE_RATIO = 0.02
 
 
-def is_enabled() -> bool:
-    return os.environ.get("NOVELGEN_SELF_REFINE", "1") != "0"
+def is_enabled(db_path=None) -> bool:
+    """On by default. Precedence:
+      1. NOVELGEN_SELF_REFINE=0 in the environment forces it OFF (power-user
+         override that beats the stored setting).
+      2. Otherwise the persisted app setting "self_refine" (set from the GUI
+         Settings tab) controls it: "0" disables, anything else enables.
+      3. Default when unset: enabled.
+    """
+    if os.environ.get("NOVELGEN_SELF_REFINE") == "0":
+        return False
+    try:
+        import db
+        return db.get_setting("self_refine", "1", db_path) != "0"
+    except Exception:
+        # DB unavailable (e.g. unit tests) — fall back to the env default.
+        return os.environ.get("NOVELGEN_SELF_REFINE", "1") != "0"
 
 
 def _fmt_world_rules(state: ChapterGraphState) -> str:
@@ -103,8 +117,8 @@ def make_self_refine_node(
     _p = print_fn
 
     def node(state: ChapterGraphState) -> dict:
-        if not is_enabled():
-            _p("  [self-refine] disabled (NOVELGEN_SELF_REFINE=0) — skipping")
+        if not is_enabled(db_path):
+            _p("  [self-refine] disabled (Settings) — skipping")
             return {"chapter_prose": state.chapter_prose}
         if not state.chapter_prose:
             return {"chapter_prose": state.chapter_prose}

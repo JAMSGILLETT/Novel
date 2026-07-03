@@ -88,6 +88,28 @@ def test_llm_error_keeps_current_draft(monkeypatch):
     assert out["chapter_prose"] == "keep me"
 
 
+def test_db_setting_toggles_enabled(monkeypatch, tmp_db_path):
+    import db
+    db.init_db(tmp_db_path)
+    monkeypatch.delenv("NOVELGEN_SELF_REFINE", raising=False)
+    # Default (unset) → enabled.
+    assert node_self_refine.is_enabled(tmp_db_path) is True
+    # Stored "0" → disabled.
+    db.set_setting("self_refine", "0", tmp_db_path)
+    assert node_self_refine.is_enabled(tmp_db_path) is False
+    # Stored "1" → enabled again.
+    db.set_setting("self_refine", "1", tmp_db_path)
+    assert node_self_refine.is_enabled(tmp_db_path) is True
+
+
+def test_env_zero_overrides_db_setting(monkeypatch, tmp_db_path):
+    import db
+    db.init_db(tmp_db_path)
+    db.set_setting("self_refine", "1", tmp_db_path)  # stored ON
+    monkeypatch.setenv("NOVELGEN_SELF_REFINE", "0")  # env forces OFF
+    assert node_self_refine.is_enabled(tmp_db_path) is False
+
+
 def test_empty_prose_is_noop(monkeypatch):
     monkeypatch.setenv("NOVELGEN_SELF_REFINE", "1")
     calls = _stub_chat(monkeypatch, [])
