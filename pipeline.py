@@ -27,7 +27,7 @@ from schema import ChapterGraphState, MAX_CANON_CHECK_RETRIES, MAX_CRAFT_CHECK_R
 # a crash mid-chapter resumes after the last finished node instead of starting
 # the whole chapter over.
 _STAGES = [
-    "outline", "context", "write",
+    "outline", "context", "write", "self_refine",
     "canon", "craft", "summarize", "book_summary",
     "extract", "reconcile", "persist",
 ]
@@ -400,6 +400,20 @@ def run_chapter(
         p(f"  {word_count} words written")
         p(f"  Done in {_elapsed(t0)}")
         _ckpt("write", state)
+
+    # ── Craft Self-Refine (cheap, craft-only, before the grounded gate) ──
+    # The model improves its own draft's craft before the expensive grounded
+    # Evaluator + best-of-N reviser run, so fewer costly revision rounds fire.
+    # Canon is untouched here — it stays the external grounded gate below.
+    from node_self_refine import make_self_refine_node
+    if _run("self_refine"):
+        stage(f"SELF-REFINE (craft)  [{_MODEL}]")
+        t0 = time.time()
+        result = make_self_refine_node(db_path=db_path, print_fn=node_p)(state)
+        state = state.model_copy(update=result)
+        p(f"  {len((state.chapter_prose or '').split())} words after craft self-refine")
+        p(f"  Done in {_elapsed(t0)}")
+        _ckpt("self_refine", state)
 
     # ── Node 6: Combined Canon + Craft Check ──────────────────────
     # Single LLM call evaluates both continuity and writing quality together.

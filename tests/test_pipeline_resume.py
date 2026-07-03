@@ -61,7 +61,7 @@ class StubNodes:
                 raise RuntimeError(f"simulated crash in {stage}")
 
         import node_outline_manager, node_context_builder
-        import node_unified_writer, node_combined_check
+        import node_unified_writer, node_self_refine, node_combined_check
         import node_chapter_summarizer, node_memory_extractor
         import node_reconciliation, node_persistence
         import llm_client, vector_store, pipeline
@@ -79,6 +79,8 @@ class StubNodes:
                    lambda **kw: lambda s, violation_feedback=None: (count("write"),
                        {"story_plan": _stub_plan(), "chapter_prose": "Stub prose.",
                         "character_reasonings": []})[1])
+        mp.setattr(node_self_refine, "make_self_refine_node",
+                   lambda **kw: lambda s: (count("self_refine"), {"chapter_prose": s.chapter_prose})[1])
         # Combined check replaces the separate canon + craft nodes: one call
         # returns both results. Count both stage keys so resume assertions still
         # see "canon" and "craft" ran exactly once.
@@ -140,7 +142,7 @@ def test_crash_then_resume_skips_completed_nodes(monkeypatch, tmp_db_path, tmp_p
     stubs2 = StubNodes(monkeypatch, tmp_db_path)
     state = _run(tmp_path, tmp_db_path)
 
-    for skipped in ("outline", "context", "write", "canon", "craft"):
+    for skipped in ("outline", "context", "write", "self_refine", "canon", "craft"):
         assert skipped not in stubs2.calls, f"{skipped} already completed — must not re-run"
     for ran in ("summarize", "book_summary", "extract", "reconcile", "persist"):
         assert stubs2.calls.get(ran) == 1, f"{ran} was not completed — must run on resume"
