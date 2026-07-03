@@ -79,6 +79,13 @@ FIELD_SPECS: dict[str, list] = {
         ("goals",            "Goals  (one per line)",            "list",   False),
         ("knowledge",        "Knowledge  (one per line)",        "list",   False),
     ],
+    # One per story (like POV State). Beats and character arcs are managed by
+    # the pipeline (mechanical updates + periodic LLM revision), not edited here.
+    "Story Outline": [
+        ("premise",        "Premise  (1–2 sentence core idea the story planner steers by)", "text", False),
+        ("theme",          "Theme  (thematic throughline)",                                 "text", False),
+        ("planned_ending", "Planned Ending  (rough direction — it will evolve)",           "text", False),
+    ],
     # ── WorldEntity-backed types (category + name + description + attributes) ──
     "Organization": [
         ("name",        "Name",                          "entry", True),
@@ -328,7 +335,7 @@ class WorldBibleTab:
         entities = self._load_all(entity_type)
         for entity in entities:
             label = getattr(entity, "name", None) or getattr(entity, "title", None) \
-                    or f"{entity_type} (no name)"
+                    or ("Story Outline" if entity_type == "Story Outline" else f"{entity_type} (no name)")
             btn = ctk.CTkButton(
                 self._list_frame,
                 text=label,
@@ -570,6 +577,24 @@ class WorldBibleTab:
                 obj = POVState(**kwargs)
             db.upsert_pov_state(obj, self.story_id, self.db_path)
 
+        elif entity_type == "Story Outline":
+            from datetime import datetime
+            from schema import StoryOutline
+            # Empty fields are applied (clearing the premise is a valid edit),
+            # so no blank-value filtering here. Beats/arcs are left untouched.
+            updates = {
+                "premise":        data.get("premise") or "",
+                "theme":          data.get("theme") or "",
+                "planned_ending": data.get("planned_ending") or "",
+                "updated_at":     datetime.utcnow(),
+            }
+            existing = self._current_entity or db.get_story_outline(self.story_id, self.db_path)
+            if existing:
+                obj = existing.model_copy(update=updates)
+            else:
+                obj = StoryOutline(story_id=self.story_id, **updates)
+            db.upsert_story_outline(obj, self.db_path)
+
         elif entity_type in _WORLD_ENTITY_TYPES:
             from schema import WorldEntity
             existing = self._current_entity
@@ -592,7 +617,9 @@ class WorldBibleTab:
             db.upsert_world_entity(obj, self.story_id, self.db_path)
             embed("world_entity", obj.id, vs.world_entity_text(obj), sid=self.story_id)
 
-        self._current_entity = None
+        # Keep the saved object as the current entity so a second Save press
+        # updates it in place (same id) instead of inserting a duplicate.
+        self._current_entity = obj
 
     # ── Delete ────────────────────────────────────────────────────────────
 
@@ -630,6 +657,10 @@ class WorldBibleTab:
         }
         if entity_type == "POV State":
             conn.execute("DELETE FROM pov_state WHERE story_id = ?", (self.story_id,))
+        elif entity_type == "Story Outline":
+            # Removing the outline makes the next generation re-create it from
+            # scratch (LLM init on cold start, or a fresh empty outline mid-story).
+            conn.execute("DELETE FROM story_outline WHERE story_id = ?", (self.story_id,))
         elif entity_type in table_map:
             table, scoped = table_map[entity_type]
             eid = getattr(entity, "id", None) or getattr(entity, "rule_id", None)
@@ -663,6 +694,9 @@ class WorldBibleTab:
             elif entity_type == "POV State":
                 pov = db.get_pov_state(self.story_id, self.db_path)
                 return [pov] if pov else []
+            elif entity_type == "Story Outline":
+                outline = db.get_story_outline(self.story_id, self.db_path)
+                return [outline] if outline else []
             elif entity_type in _WORLD_ENTITY_TYPES:
                 return db.get_world_entities_by_category(entity_type, self.story_id, self.db_path)
         except Exception:

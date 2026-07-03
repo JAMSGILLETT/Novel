@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import db
-from llm_client import MODEL, chat_json
+from llm_client import chat_json
 from node_story_planner import full_history_text
 from schema import (
     Character, CharacterConstraint, CharacterReasoning,
@@ -174,10 +174,12 @@ _REASONING_DEFAULTS: dict = {
 # ---------------------------------------------------------------------------
 
 def make_character_reasoner_node(
-    model: str = MODEL,
+    model: Optional[str] = None,
     ollama_client=None,
     db_path: Optional[Path] = None,
+    print_fn=print,
 ) -> Callable[[ChapterGraphState], dict]:
+    _p = print_fn
 
     def _reason_one(
         character: Character, constraint: CharacterConstraint,
@@ -229,7 +231,7 @@ def make_character_reasoner_node(
                 continue
             character = db.get_character_by_id(cid, state.story_id, db_path)
             if character is None:
-                print(f"  [character_reasoner] WARNING: requested off-screen character "
+                _p(f"  [character_reasoner] WARNING: requested off-screen character "
                       f"{cid!r} not found in DB — skipping")
                 continue
             characters_to_reason.append(character)
@@ -247,7 +249,7 @@ def make_character_reasoner_node(
         prior_actions: list[tuple[str, list[str]]] = []
         for character in characters_to_reason:
             constraint = constraint_map.get(character.id, empty_constraint)
-            print(f"  Reasoning for: {character.name}")
+            _p(f"  Reasoning for: {character.name}")
             reasoning = _reason_one(character, constraint, plan, pack, history_text, prior_actions, state.story_id)
             reasonings.append(reasoning)
             prior_actions.append((character.name, reasoning.action_intentions))

@@ -22,7 +22,20 @@ from typing import Callable, Optional
 
 from schema import ChapterGraphState, MAX_CANON_CHECK_RETRIES, MAX_CRAFT_CHECK_RETRIES
 
-BACKUP_RETENTION = 10  # keep the last N timestamped story.db backups
+# Ordered stage keys for run_chapter — one per stage() banner. Each completed
+# stage checkpoints the full pipeline state to the DB (chapter_checkpoints), so
+# a crash mid-chapter resumes after the last finished node instead of starting
+# the whole chapter over.
+_STAGES = [
+    "outline", "context", "write",
+    "canon", "craft", "summarize", "book_summary",
+    "extract", "reconcile", "persist",
+]
+_TOTAL_STAGES = len(_STAGES)  # for progress %
+
+
+class GenerationCancelled(Exception):
+    """Raised inside run_chapter when should_cancel() returns True between stages."""
 
 
 def _elapsed(t0: float) -> str:
@@ -38,27 +51,12 @@ def _section(p, title: str) -> None:
 
 
 def _backup_database(db_path: Path, chapter_number: int, print_fn=print) -> None:
-    """Copies db_path to backups/ before this chapter's writes begin, and prunes
-    old backups past BACKUP_RETENTION. Never blocks generation — a failure here
-    only warns, since losing a backup is far less costly than losing the DB."""
-    if not db_path.exists():
-        return
+    """Snapshot the DB to backups/ before this chapter's writes begin. Never
+    blocks generation — a failure here only warns, since losing a backup is far
+    less costly than losing the DB. (db.create_backup checkpoints + prunes.)"""
     try:
-        import shutil
-        from datetime import datetime
-
-        backups_dir = db_path.parent / "backups"
-        backups_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        dest = backups_dir / f"{db_path.stem}_ch{chapter_number}_{stamp}.db"
-        shutil.copy2(db_path, dest)
-
-        existing = sorted(
-            backups_dir.glob(f"{db_path.stem}_ch*_*.db"),
-            key=lambda p: p.stat().st_mtime,
-        )
-        for stale in existing[:-BACKUP_RETENTION]:
-            stale.unlink(missing_ok=True)
+        import db as db_module
+        db_module.create_backup(db_path, tag=f"ch{chapter_number}")
     except Exception as e:
         print_fn(f"  [warn] Database backup failed (continuing anyway): {e}")
 
@@ -95,9 +93,7 @@ def _run_revision_loop(
             result = first_result
         else:
             result = check_fn(current_state)
-        problems = getattr(result, "violations", None)
-        if problems is None:
-            problems = getattr(result, "issues", [])
+        problems = list(getattr(result, "violations", None) or []) + list(getattr(result, "issues", []))
 
         if result.passed:
             p(f"  {label} check PASSED")
@@ -233,23 +229,32 @@ def _update_hierarchical_summary(
     db_path: Path,
     model: str,
     print_fn=print,
+    skip_rolling_update: bool = False,
 ) -> tuple[str, list[str]]:
     """Updates the rolling summary as before, then — every
     OUTLINE_REVISION_INTERVAL chapters — compresses it into a new permanent
     ActSummary and resets the rolling summary for the next act.
-    Returns (new_rolling_summary, new_act_summaries_list)."""
+    Returns (new_rolling_summary, new_act_summaries_list).
+
+    skip_rolling_update: if True, state.book_summary was already updated by
+    the chapter summarizer node in one combined LLM call — skip the separate
+    _update_book_summary call."""
     from node_outline_manager import OUTLINE_REVISION_INTERVAL
     from schema import ActSummary
     import db as db_module
 
-    new_rolling = _update_book_summary(
-        current=state.book_summary,
-        chapter_summary=state.chapter_summary,
-        model=model,
-        story_id=story_id,
-        db_path=db_path,
-        print_fn=print_fn,
-    )
+    if skip_rolling_update:
+        print_fn("  Rolling summary already updated by summarizer — skipping separate call")
+        new_rolling = state.book_summary or ""
+    else:
+        new_rolling = _update_book_summary(
+            current=state.book_summary,
+            chapter_summary=state.chapter_summary,
+            model=model,
+            story_id=story_id,
+            db_path=db_path,
+            print_fn=print_fn,
+        )
     act_summaries = list(state.act_summaries)
 
     if state.chapter_number > 0 and state.chapter_number % OUTLINE_REVISION_INTERVAL == 0:
@@ -279,25 +284,45 @@ def run_chapter(
     manuscripts_dir: Path,
     book_title: str = "My Novel",
     print_fn: Callable[[str], None] = print,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    progress_fn: Optional[Callable[[int, int, str], None]] = None,
+    debug: bool = False,
 ) -> ChapterGraphState:
     """
-    Run the full 10-node pipeline for one chapter.
+    Run the full pipeline for one chapter.
     print_fn receives each status line — swap in a GUI writer for streaming output.
+    should_cancel, if given, is polled between stages; when it returns True the
+    run aborts by raising GenerationCancelled (no partial chapter is saved).
+    progress_fn(step, total, label), if given, is called as each stage begins.
+    debug=True routes all internal node prints through print_fn (visible in GUI).
     Returns the final ChapterGraphState.
     """
     p = print_fn  # shorthand
+    node_p = p if debug else print  # internal node output: GUI in debug mode, stdout otherwise
+
+    # One helper per stage: poll for cancellation, report progress, print banner.
+    _stage_no = [0]
+
+    def stage(title: str) -> None:
+        if should_cancel is not None and should_cancel():
+            # Deliberate abort — drop the crash checkpoint so the next run
+            # starts a fresh chapter (Stop means "discard", crash means "resume").
+            try:
+                db_module.delete_chapter_checkpoint(story_id, db_path)
+            except Exception:
+                pass
+            raise GenerationCancelled()
+        _stage_no[0] += 1
+        if progress_fn is not None:
+            progress_fn(_stage_no[0], _TOTAL_STAGES, title)
+        _section(p, title)
 
     import db as db_module
     import vector_store as vs
-    from node_input_router import make_input_router_node
     from node_outline_manager import make_outline_manager_node, maybe_revise_outline
     from node_context_builder import make_context_builder_node, STALE_PLOTLINE_THRESHOLD
-    from node_story_planner import make_story_planner_node
-    from llm_client import MODEL as _MODEL
-    from node_character_reasoner import make_character_reasoner_node
-    from node_story_writer import make_story_writer_node
-    from node_canon_check import make_canon_check_node
-    from node_craft_check import make_craft_check_node
+    from llm_client import get_model
+    _MODEL = get_model()  # snapshot the active model for this run's banners/summaries
     from node_chapter_summarizer import make_chapter_summarizer_node
     from node_memory_extractor import make_memory_extractor_node
     from node_reconciliation import make_reconciliation_node
@@ -320,183 +345,237 @@ def run_chapter(
 
     chroma_client = vs.get_chroma_client(chroma_path)
 
-    # ── Node 1: Input Router ──────────────────────────────────────
-    _section(p, "NODE 1 — INPUT ROUTER")
-    t0 = time.time()
-    result = make_input_router_node(db_path=db_path)(state)
-    state = state.model_copy(update=result)
-    p(f"  Mode: {state.input_mode}  |  Chapter: {state.chapter_number}")
-    p(f"  Done in {_elapsed(t0)}")
+    # ── Chapter number & mode (pure DB facts, no LLM) ─────────────
+    latest = db_module.get_latest_chapter_number(story_id, db_path)
+    state = state.model_copy(update={
+        "input_mode": "cold_start" if latest is None else "continuation",
+        "chapter_number": (latest or 0) + 1,
+    })
 
-    # Back up story.db before this chapter writes anything (now that we know the chapter number)
-    _backup_database(db_path, state.chapter_number, print_fn=p)
+    # ── Crash recovery: resume an interrupted chapter from its checkpoint ──
+    # A checkpoint row only survives a crash or unexpected error — chapters that
+    # finish (or are cancelled with Stop) delete theirs. If one exists for the
+    # chapter we're about to generate, restore the saved state and skip every
+    # node that already completed.
+    done_stages: set = set()
+    ckpt = db_module.get_chapter_checkpoint(story_id, db_path)
+    if ckpt is not None:
+        # Also resumable: crash after Node 10 registered the chapter (so
+        # `latest` already includes it) but before the manuscript file was
+        # written — only the post-persistence steps remain.
+        resumable = ckpt["chapter_number"] == state.chapter_number or (
+            ckpt["chapter_number"] == latest and ckpt["last_stage"] == _STAGES[-1]
+        )
+        if resumable:
+            try:
+                state = ChapterGraphState.model_validate_json(ckpt["state_json"])
+                done_stages = set(_STAGES[: _STAGES.index(ckpt["last_stage"]) + 1])
+            except Exception as e:
+                p(f"  [warn] Couldn't load the crash checkpoint — starting the chapter fresh: {e}")
+                db_module.delete_chapter_checkpoint(story_id, db_path)
+        else:
+            # Belongs to an older, already-completed chapter — stale, discard.
+            db_module.delete_chapter_checkpoint(story_id, db_path)
+
+    p(f"  Mode: {state.input_mode}  |  Chapter: {state.chapter_number}")
+    if done_stages:
+        _stage_no[0] = len(done_stages)  # progress % accounts for skipped nodes
+        p(f"  Resuming chapter {state.chapter_number} from checkpoint — "
+          f"{len(done_stages)}/{len(_STAGES)} node(s) already completed, "
+          f"continuing after '{ckpt['last_stage']}'")
+        if user_input.strip() and user_input.strip() != (state.user_input or "").strip():
+            p("  [note] Finishing the interrupted chapter with its original input; "
+              "your new input will apply to the next chapter.")
+
+    def _run(key: str) -> bool:
+        return key not in done_stages
+
+    def _ckpt(key: str, snapshot: ChapterGraphState) -> None:
+        """Persist the full pipeline state after a completed node. Best-effort:
+        a failure only costs crash recovery for this node, never the chapter."""
+        try:
+            db_module.save_chapter_checkpoint(
+                story_id, snapshot.chapter_number, key, snapshot.model_dump_json(), db_path,
+            )
+        except Exception as e:
+            p(f"  [warn] Checkpoint save failed (crash recovery unavailable for this node): {e}")
+
+    # Back up story.db before this chapter writes anything (now that we know the
+    # chapter number). Skipped on resume — the pre-chapter snapshot already
+    # exists, and a new one would capture mid-chapter state under the same tag.
+    if not done_stages:
+        _backup_database(db_path, state.chapter_number, print_fn=p)
 
     # ── Outline Manager (load, or generate on cold start) ─────────
-    _section(p, "OUTLINE MANAGER")
-    t0 = time.time()
-    outline_node = make_outline_manager_node(db_path=db_path)
-    result = outline_node(state)
-    state = state.model_copy(update=result)
-    outline = state.story_outline
-    p(f"  Premise: {outline.premise or '(not yet set)'}")
-    p(f"  Beats: {len(outline.beats)}  |  Character arcs: {len(outline.character_arcs)}  |  v{outline.version}")
-    p(f"  Done in {_elapsed(t0)}")
+    if _run("outline"):
+        stage("OUTLINE MANAGER")
+        t0 = time.time()
+        outline_node = make_outline_manager_node(db_path=db_path)
+        result = outline_node(state)
+        state = state.model_copy(update=result)
+        outline = state.story_outline
+        p(f"  Premise: {outline.premise or '(not yet set)'}")
+        p(f"  Beats: {len(outline.beats)}  |  Character arcs: {len(outline.character_arcs)}  |  v{outline.version}")
+        p(f"  Done in {_elapsed(t0)}")
+        _ckpt("outline", state)
 
     # ── Node 2: Context Builder ───────────────────────────────────
-    _section(p, "NODE 2 — CONTEXT BUILDER")
-    t0 = time.time()
-    context_node = make_context_builder_node(chroma_client=chroma_client, db_path=db_path)
-    result = context_node(state)
-    state = state.model_copy(update=result)
-    pack = state.context_pack
-    p(f"  Characters: {[c.name for c in pack.active_characters]}")
-    p(f"  Plotlines:  {[pl.name for pl in pack.active_plotlines]}")
-    p(f"  Locations:  {[l.name for l in pack.nearby_locations]}")
-    if pack.stale_plotlines:
-        p(f"  [nudge] Stale plotlines (quiet {STALE_PLOTLINE_THRESHOLD}+ chapters): "
-          f"{[pl.name for pl in pack.stale_plotlines]}")
-    p(f"  Done in {_elapsed(t0)}")
+    if _run("context"):
+        stage("NODE 2 — CONTEXT BUILDER")
+        t0 = time.time()
+        context_node = make_context_builder_node(chroma_client=chroma_client, db_path=db_path)
+        result = context_node(state)
+        state = state.model_copy(update=result)
+        pack = state.context_pack
+        p(f"  Characters: {[c.name for c in pack.active_characters]}")
+        p(f"  Plotlines:  {[pl.name for pl in pack.active_plotlines]}")
+        p(f"  Locations:  {[l.name for l in pack.nearby_locations]}")
+        if pack.stale_plotlines:
+            p(f"  [nudge] Stale plotlines (quiet {STALE_PLOTLINE_THRESHOLD}+ chapters): "
+              f"{[pl.name for pl in pack.stale_plotlines]}")
+        p(f"  Done in {_elapsed(t0)}")
+        _ckpt("context", state)
 
-    # ── Node 3: Story Planner ─────────────────────────────────────
-    _section(p, f"NODE 3 — STORY PLANNER  [{_MODEL}]")
-    t0 = time.time()
-    result = make_story_planner_node(db_path=db_path)(state)
-    state = state.model_copy(update=result)
-    plan = state.story_plan
-    p(f"  Scenes: {len(plan.scenes)}  |  Conflicts: {len(plan.conflicts)}")
-    for i, scene in enumerate(plan.scenes, 1):
-        p(f"    {i}. {scene}")
-    p(f"  Done in {_elapsed(t0)}")
+    # ── Nodes 3+4+5: Unified Writer ──────────────────────────────
+    # One LLM call: the model thinks through the plan and character motivations
+    # internally (via its reasoning/think block), then produces both a structured
+    # plan (needed by canon/craft checks) and the chapter prose.
+    from node_unified_writer import make_unified_writer_node
+    writer_node = make_unified_writer_node(db_path=db_path, print_fn=node_p)
+    if _run("write"):
+        stage(f"NODES 3-5 — UNIFIED WRITER  [{_MODEL}]")
+        t0 = time.time()
+        result = writer_node(state)
+        state = state.model_copy(update=result)
+        plan = state.story_plan
+        if plan:
+            p(f"  Plan: {len(plan.scenes)} scene(s) | {len(plan.conflicts)} conflict(s)")
+            for i, scene in enumerate(plan.scenes, 1):
+                p(f"    {i}. {scene}")
+        word_count = len((state.chapter_prose or "").split())
+        p(f"  {word_count} words written")
+        p(f"  Done in {_elapsed(t0)}")
+        _ckpt("write", state)
 
-    # ── Node 4: Character Reasoner ────────────────────────────────
-    _section(p, f"NODE 4 — CHARACTER REASONER  [{_MODEL}]")
-    t0 = time.time()
-    result = make_character_reasoner_node(db_path=db_path)(state)
-    state = state.model_copy(update={
-        "character_reasonings": state.character_reasonings + result["character_reasonings"]
-    })
-    char_map = {c.id: c.name for c in pack.active_characters}
-    for r in state.character_reasonings:
-        p(f"  {char_map.get(r.character_id, '?')}: {r.dialogue_intent}")
-    p(f"  Done in {_elapsed(t0)}")
+    # ── Node 6: Combined Canon + Craft Check ──────────────────────
+    # Single LLM call evaluates both continuity and writing quality together.
+    # If the prose fails either check, the writer revises and the combined
+    # check re-runs on the new prose. Both "canon" and "craft" stage keys map
+    # to this one block so resume-from-checkpoint still works.
+    from node_combined_check import make_combined_check_node
 
-    # ── Node 5: Story Writer ──────────────────────────────────────
-    _section(p, f"NODE 5 — STORY WRITER  [{_MODEL}]")
-    t0 = time.time()
-    writer_node = make_story_writer_node(db_path=db_path)
-    result = writer_node(state)
-    state = state.model_copy(update=result)
-    word_count = len((state.chapter_prose or "").split())
-    p(f"  {word_count} words written")
-    p(f"  Done in {_elapsed(t0)}")
+    combined_check = make_combined_check_node(db_path=db_path)
 
-    # ── Node 6 & Craft: Canon + Craft checks ──────────────────────
-    # The two checks read the same prose and are independent, so their first
-    # pass runs concurrently (two LLM calls at once). If canon then has to
-    # revise the prose, the craft first-pass is stale and is discarded so craft
-    # still evaluates the canon-approved text (preserving the original ordering).
-    _section(p, f"NODE 6 — CANON CHECK  [{_MODEL}]")
-    t0 = time.time()
-    canon_check = make_canon_check_node(db_path=db_path)
-    craft_check = make_craft_check_node(db_path=db_path)
+    def _combined_check_wrapper(s):
+        """Wraps combined check so _run_revision_loop sees a unified .passed."""
+        canon_r, craft_r = combined_check(s)
+        # Attach both result sets to a simple namespace for the loop
+        class _R:
+            passed = canon_r.passed and craft_r.passed
+            violations = list(canon_r.violations)
+            issues = list(craft_r.issues)
+            canon = canon_r
+            craft = craft_r
+        return _R()
 
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        fut_canon = ex.submit(canon_check, state)
-        fut_craft = ex.submit(craft_check, state)
-        canon_first = fut_canon.result()
-        craft_first = fut_craft.result()
-
-    state, canon_result, canon_attempts, canon_flagged = _run_revision_loop(
-        state, canon_check, writer_node, MAX_CANON_CHECK_RETRIES, "Canon",
-        print_fn=p, first_result=canon_first,
-    )
-    state = state.model_copy(update={
-        "canon_check_result": canon_result,
-        "canon_check_attempts": canon_attempts,
-        "flagged_for_review": canon_flagged,
-        "flagged_violations": canon_result.violations if canon_flagged else [],
-    })
-    if state.flagged_for_review:
-        p(f"  *** FLAGGED — {len(state.flagged_violations)} violation(s) remain ***")
-        for v in state.flagged_violations:
-            p(f"    [{v.severity}] {v.description}")
-    else:
-        p(f"  Passed after {state.canon_check_attempts} attempt(s)")
-    p(f"  Done in {_elapsed(t0)}")
-
-    # ── Craft Check ────────────────────────────────────────────────
-    _section(p, f"CRAFT CHECK  [{_MODEL}]")
-    t0 = time.time()
-    # The concurrent craft first-pass is only valid if canon left prose untouched
-    # (i.e. canon passed on its first attempt without a rewrite).
-    craft_seed = craft_first if canon_attempts == 1 else None
-    state, craft_result, craft_attempts, craft_flagged = _run_revision_loop(
-        state, craft_check, writer_node, MAX_CRAFT_CHECK_RETRIES, "Craft",
-        print_fn=p, first_result=craft_seed,
-    )
-    state = state.model_copy(update={
-        "craft_check_result": craft_result,
-        "craft_check_attempts": craft_attempts,
-        "flagged_for_craft_review": craft_flagged,
-        "craft_issues": craft_result.issues if craft_flagged else [],
-    })
-    if state.flagged_for_craft_review:
-        p(f"  *** FLAGGED — {len(state.craft_issues)} craft issue(s) remain ***")
-        for v in state.craft_issues:
-            p(f"    [{v.severity}] {v.description}")
-    else:
-        p(f"  Passed after {state.craft_check_attempts} attempt(s)")
-    p(f"  Done in {_elapsed(t0)}")
+    if _run("canon") or _run("craft"):
+        stage(f"NODE 6 — CANON + CRAFT CHECK  [{_MODEL}]")
+        t0 = time.time()
+        max_retries = max(MAX_CANON_CHECK_RETRIES, MAX_CRAFT_CHECK_RETRIES)
+        state, combined_result, attempts, flagged = _run_revision_loop(
+            state, _combined_check_wrapper, writer_node, max_retries, "Canon+Craft",
+            print_fn=p,
+        )
+        canon_result  = combined_result.canon
+        craft_result  = combined_result.craft
+        canon_flagged = not canon_result.passed and flagged
+        craft_flagged = not craft_result.passed and flagged
+        state = state.model_copy(update={
+            "canon_check_result":      canon_result,
+            "canon_check_attempts":    attempts,
+            "flagged_for_review":      canon_flagged,
+            "flagged_violations":      canon_result.violations if canon_flagged else [],
+            "craft_check_result":      craft_result,
+            "craft_check_attempts":    attempts,
+            "flagged_for_craft_review": craft_flagged,
+            "craft_issues":            craft_result.issues if craft_flagged else [],
+        })
+        if canon_flagged:
+            p(f"  *** CANON FLAGGED — {len(state.flagged_violations)} violation(s) remain ***")
+            for v in state.flagged_violations:
+                p(f"    [{v.severity}] {v.description}")
+        if craft_flagged:
+            p(f"  *** CRAFT FLAGGED — {len(state.craft_issues)} issue(s) remain ***")
+            for v in state.craft_issues:
+                p(f"    [{v.severity}] {v.description}")
+        if not flagged:
+            p(f"  Passed after {attempts} attempt(s)")
+        p(f"  Done in {_elapsed(t0)}")
+        _ckpt("canon", state)
+        _ckpt("craft", state)
 
     # ── Node 7: Chapter Summarizer ────────────────────────────────
-    _section(p, f"NODE 7 — CHAPTER SUMMARIZER  [{_MODEL}]")
-    t0 = time.time()
-    result = make_chapter_summarizer_node(db_path=db_path)(state)
-    state = state.model_copy(update=result)
-    p(f"  {state.chapter_summary.short_summary}")
-    p(f"  Done in {_elapsed(t0)}")
+    _summarizer_updated_book = False
+    if _run("summarize"):
+        stage(f"NODE 7 — CHAPTER SUMMARIZER  [{_MODEL}]")
+        t0 = time.time()
+        result = make_chapter_summarizer_node(db_path=db_path, print_fn=node_p)(state)
+        _summarizer_updated_book = "book_summary" in result
+        state = state.model_copy(update=result)
+        p(f"  {state.chapter_summary.short_summary}")
+        p(f"  Done in {_elapsed(t0)}")
+        _ckpt("summarize", state)
 
     # ── Hierarchical summary update (rolling + permanent act summaries) ──
-    _section(p, "BOOK SUMMARY UPDATE")
-    t0 = time.time()
-    new_book_summary, new_act_summaries = _update_hierarchical_summary(
-        state, story_id=story_id, db_path=db_path, model=_MODEL, print_fn=p,
-    )
-    state = state.model_copy(update={"book_summary": new_book_summary, "act_summaries": new_act_summaries})
-    db_module.upsert_book_summary(story_id, new_book_summary, db_path)
-    p(f"  Done in {_elapsed(t0)}")
+    if _run("book_summary"):
+        stage("BOOK SUMMARY UPDATE")
+        t0 = time.time()
+        new_book_summary, new_act_summaries = _update_hierarchical_summary(
+            state, story_id=story_id, db_path=db_path, model=_MODEL, print_fn=p,
+            skip_rolling_update=_summarizer_updated_book,
+        )
+        state = state.model_copy(update={"book_summary": new_book_summary, "act_summaries": new_act_summaries})
+        db_module.upsert_book_summary(story_id, new_book_summary, db_path)
+        p(f"  Done in {_elapsed(t0)}")
+        _ckpt("book_summary", state)
 
     # ── Node 8: Memory Extractor ──────────────────────────────────
-    _section(p, f"NODE 8 — MEMORY EXTRACTOR  [{_MODEL}]")
-    t0 = time.time()
-    extractor_result = make_memory_extractor_node(db_path=db_path)(state)
-    state = state.model_copy(update={
-        "memory_patches":  state.memory_patches + extractor_result["memory_patches"],
-        "new_characters":  extractor_result.get("new_characters", []),
-        "new_locations":   extractor_result.get("new_locations", []),
-        "new_plotlines":   extractor_result.get("new_plotlines", []),
-        "new_world_rules": extractor_result.get("new_world_rules", []),
-        "new_world_lore":  extractor_result.get("new_world_lore", []),
-    })
-    p(f"  {len(state.memory_patches)} patch(es), "
-      f"{sum(len(extractor_result.get(k,[])) for k in ('new_characters','new_locations','new_plotlines','new_world_rules','new_world_lore'))} new entity/entities")
-    p(f"  Done in {_elapsed(t0)}")
+    if _run("extract"):
+        stage(f"NODE 8 — MEMORY EXTRACTOR  [{_MODEL}]")
+        t0 = time.time()
+        extractor_result = make_memory_extractor_node(db_path=db_path, print_fn=node_p)(state)
+        state = state.model_copy(update={
+            "memory_patches":  state.memory_patches + extractor_result["memory_patches"],
+            "new_characters":  extractor_result.get("new_characters", []),
+            "new_locations":   extractor_result.get("new_locations", []),
+            "new_plotlines":   extractor_result.get("new_plotlines", []),
+            "new_world_rules": extractor_result.get("new_world_rules", []),
+            "new_world_lore":  extractor_result.get("new_world_lore", []),
+        })
+        p(f"  {len(state.memory_patches)} patch(es), "
+          f"{sum(len(extractor_result.get(k,[])) for k in ('new_characters','new_locations','new_plotlines','new_world_rules','new_world_lore'))} new entity/entities")
+        p(f"  Done in {_elapsed(t0)}")
+        _ckpt("extract", state)
 
     # ── Node 9: Reconciliation ────────────────────────────────────
-    _section(p, "NODE 9 — RECONCILIATION")
-    t0 = time.time()
-    result = make_reconciliation_node()(state)
-    state = state.model_copy(update=result)
-    p(f"  {len(state.reconciled_patches)} patch(es), "
-      f"{len(state.reconciliation_conflicts)} conflict(s) resolved")
-    p(f"  Done in {_elapsed(t0)}")
+    if _run("reconcile"):
+        stage("NODE 9 — RECONCILIATION")
+        t0 = time.time()
+        result = make_reconciliation_node(print_fn=node_p)(state)
+        state = state.model_copy(update=result)
+        p(f"  {len(state.reconciled_patches)} patch(es), "
+          f"{len(state.reconciliation_conflicts)} conflict(s) resolved")
+        p(f"  Done in {_elapsed(t0)}")
+        _ckpt("reconcile", state)
 
     # ── Node 10: Persistence ──────────────────────────────────────
-    _section(p, "NODE 10 — PERSISTENCE")
-    t0 = time.time()
-    make_persistence_node(chroma_client=chroma_client, db_path=db_path)(state)
-    p(f"  World state saved")
-    p(f"  Done in {_elapsed(t0)}")
+    if _run("persist"):
+        stage("NODE 10 — PERSISTENCE")
+        t0 = time.time()
+        make_persistence_node(chroma_client=chroma_client, db_path=db_path, print_fn=node_p)(state)
+        p(f"  World state saved")
+        p(f"  Done in {_elapsed(t0)}")
+        _ckpt("persist", state)
 
     # ── Save chapter file ─────────────────────────────────────────
     out_file = _save_chapter(state, manuscripts_dir, book_title)
@@ -506,5 +585,8 @@ def run_chapter(
     revised_outline = maybe_revise_outline(state, db_path=db_path, print_fn=p)
     if revised_outline is not None:
         state = state.model_copy(update={"story_outline": revised_outline})
+
+    # Chapter fully complete — the crash checkpoint is no longer needed.
+    db_module.delete_chapter_checkpoint(story_id, db_path)
 
     return state

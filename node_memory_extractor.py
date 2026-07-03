@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from llm_client import MODEL, chat_text
+from llm_client import chat_text
 from llm_json import extract_json_block, parse_json_response
 from schema import (
     Character, ChapterGraphState, ChapterSummary, ContextPack,
@@ -195,8 +195,220 @@ Respond with ONLY the JSON. No explanation."""
 
 
 # ---------------------------------------------------------------------------
+# Batch patch prompts — 1 LLM call for all entities of a given type
+# ---------------------------------------------------------------------------
+
+def _batch_character_prompt(characters: list, prose: str, summary: ChapterSummary) -> str:
+    blocks = []
+    for c in characters:
+        blocks.append(
+            f"- ID: {c.id}\n"
+            f"  Name: {c.name}\n"
+            f"  Personality: {c.personality}\n"
+            f"  Emotional state: {c.emotional_state or 'unknown'}\n"
+            f"  Goals: {'; '.join(c.goals) if c.goals else 'none'}\n"
+            f"  Objectives: {'; '.join(c.current_objectives) if c.current_objectives else 'none'}\n"
+            f"  Knowledge: {'; '.join(c.knowledge) if c.knowledge else 'none'}"
+        )
+    char_list = "\n".join(blocks)
+    ids = ", ".join(f'"{c.id}"' for c in characters)
+    return f"""You are tracking character state changes in a novel chapter.
+
+CHAPTER SUMMARY: {summary.medium_summary}
+
+CHAPTER PROSE (excerpt):
+{prose[:3000]}
+
+CHARACTERS TO ANALYZE:
+{char_list}
+
+For EACH character, output a patch with ONLY fields that changed. Use null for unchanged fields.
+Return a JSON array with exactly one object per character, in the same order listed above:
+
+[
+  {{
+    "entity_type": "character",
+    "entity_id": {ids.split(",")[0].strip()},
+    "emotional_state": "new state if changed, else null",
+    "knowledge_added": ["new thing learned"] or null,
+    "current_objectives": ["updated list"] or null,
+    "goals": ["updated goals"] or null,
+    "is_alive": true or false or null,
+    "current_location_id": "location_id if moved, else null",
+    "secrets_added": ["new secret"] or null
+  }}
+]
+
+Respond with ONLY the JSON array. No explanation."""
+
+
+def _batch_plotline_prompt(plotlines: list, prose: str, summary: ChapterSummary) -> str:
+    blocks = []
+    for p in plotlines:
+        devs = "; ".join(p.next_possible_developments) if p.next_possible_developments else "none"
+        blocks.append(
+            f"- ID: {p.id}\n"
+            f"  Name: {p.name}\n"
+            f"  Status: {p.status}\n"
+            f"  Stage: {p.progress_stage}\n"
+            f"  Tension: {p.current_tension}/10\n"
+            f"  Next developments: {devs}"
+        )
+    plot_list = "\n".join(blocks)
+    return f"""You are tracking plotline state changes in a novel chapter.
+
+CHAPTER SUMMARY: {summary.medium_summary}
+
+CHAPTER PROSE (excerpt):
+{prose[:3000]}
+
+PLOTLINES TO ANALYZE:
+{plot_list}
+
+For EACH plotline, output a patch with ONLY fields that changed. Use null for unchanged fields.
+Return a JSON array with exactly one object per plotline, in the same order listed above:
+
+[
+  {{
+    "entity_type": "plotline",
+    "entity_id": "plotline_id_here",
+    "status": "dormant|active|resolved|abandoned or null",
+    "progress_stage": "new stage description or null",
+    "current_tension": 0-10 integer or null,
+    "next_possible_developments": ["updated list"] or null,
+    "involved_character_ids_added": ["char_id"] or null
+  }}
+]
+
+Respond with ONLY the JSON array. No explanation."""
+
+
+def _batch_location_prompt(locations: list, prose: str, summary: ChapterSummary) -> str:
+    blocks = []
+    for loc in locations:
+        blocks.append(
+            f"- ID: {loc.id}\n"
+            f"  Name: {loc.name}\n"
+            f"  Description: {loc.description}\n"
+            f"  Tone: {loc.tone or 'none'}\n"
+            f"  Recent events: {'; '.join(loc.recent_events) if loc.recent_events else 'none'}"
+        )
+    loc_list = "\n".join(blocks)
+    return f"""You are tracking location state changes in a novel chapter.
+
+CHAPTER SUMMARY: {summary.medium_summary}
+
+CHAPTER PROSE (excerpt):
+{prose[:3000]}
+
+LOCATIONS TO ANALYZE:
+{loc_list}
+
+For EACH location, output a patch with ONLY fields that changed. Use null for unchanged fields.
+Return a JSON array with exactly one object per location, in the same order listed above:
+
+[
+  {{
+    "entity_type": "location",
+    "entity_id": "location_id_here",
+    "tone": "new tone if shifted, else null",
+    "recent_events_added": ["new event that happened here"] or null,
+    "secrets_added": ["new secret uncovered"] or null,
+    "political_control": "new controller if changed, else null"
+  }}
+]
+
+Respond with ONLY the JSON array. No explanation."""
+
+
+def _parse_batch_patches(raw: str, entities: list, patch_class, id_attr: str = "id") -> list:
+    """Parse a JSON array of patches; zip with entities to ensure correct entity_id."""
+    if not raw.strip():
+        return []
+    # Strip think blocks
+    if "<think>" in raw:
+        parts = raw.split("</think>", 1)
+        raw = parts[1].strip() if len(parts) > 1 else raw
+    try:
+        data = _parse_json(raw)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        # Might be wrapped in a key
+        if isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, list):
+                    data = v
+                    break
+        if not isinstance(data, list):
+            return []
+
+    patches = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            continue
+        entity = entities[i] if i < len(entities) else None
+        item = _unwrap_envelope(item)
+        if entity is not None:
+            item["entity_id"] = getattr(entity, id_attr)
+        try:
+            patch = patch_class.model_validate(item)
+            patches.append(patch)
+        except Exception:
+            pass
+    return patches
+
+
+# ---------------------------------------------------------------------------
 # New entity discovery — prompts and parsers
 # ---------------------------------------------------------------------------
+
+def _new_entities_prompt(
+    prose: str,
+    existing_char_names: list[str],
+    existing_loc_names: list[str],
+    existing_plot_names: list[str],
+    existing_rule_titles: list[str],
+    existing_lore_titles: list[str],
+) -> str:
+    """Single combined prompt for all 5 new-entity discovery types."""
+    def _roster(names):
+        return ", ".join(names) if names else "(none yet)"
+
+    return f"""You are reading a chapter of a novel. Identify any NEW story elements introduced for the first time.
+
+CHAPTER PROSE:
+{prose[:3000]}
+
+EXISTING (DO NOT re-list these):
+  Characters: {_roster(existing_char_names)}
+  Locations: {_roster(existing_loc_names)}
+  Plotlines: {_roster(existing_plot_names)}
+  World rules: {_roster(existing_rule_titles)}
+  World lore: {_roster(existing_lore_titles)}
+
+Only include things that genuinely appear in this chapter and are NOT already listed above.
+If nothing new exists for a category, return an empty array for it.
+
+Respond with ONLY this JSON object:
+{{
+  "new_characters": [
+    {{"name": "Name", "personality": "brief", "goals": [], "emotional_state": "", "relationships": {{}}, "knowledge": [], "secrets": []}}
+  ],
+  "new_locations": [
+    {{"name": "Name", "description": "brief", "tone": "", "political_control": null, "secrets": [], "recent_events": []}}
+  ],
+  "new_plotlines": [
+    {{"name": "Name", "status": "active", "progress_stage": "brief", "current_tension": 5, "next_possible_developments": []}}
+  ],
+  "new_world_rules": [
+    {{"rule_type": "hard_constraint", "title": "Title", "content": "full description"}}
+  ],
+  "new_world_lore": [
+    {{"category": "canon_fact", "title": "Title", "content": "full description"}}
+  ]
+}}"""
+
 
 def _new_characters_prompt(prose: str, existing_names: list[str], template: Optional[str] = None) -> str:
     from prompt_templates import DEFAULT_TEMPLATES
@@ -357,10 +569,12 @@ def _to_patch(data: dict | list, patch_class):
 # ---------------------------------------------------------------------------
 
 def make_memory_extractor_node(
-    model: str = MODEL,
+    model: Optional[str] = None,
     ollama_client=None,
     db_path=None,
+    print_fn=print,
 ) -> Callable[[ChapterGraphState], dict]:
+    _p = print_fn
 
     def node(state: ChapterGraphState) -> dict:
         if not state.chapter_prose:
@@ -368,22 +582,19 @@ def make_memory_extractor_node(
         if not state.chapter_summary:
             raise ValueError("chapter_summary must be set before memory extractor runs")
 
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from prompt_templates import get_template
+        import db as _db_module
+
         story_id = state.story_id
         tpl_character = get_template("memory_character", story_id, db_path)
         tpl_plotline = get_template("memory_plotline", story_id, db_path)
         tpl_location = get_template("memory_location", story_id, db_path)
         tpl_pov = get_template("memory_pov", story_id, db_path)
-        tpl_new_characters = get_template("memory_new_characters", story_id, db_path)
-        tpl_new_locations = get_template("memory_new_locations", story_id, db_path)
-        tpl_new_plotlines = get_template("memory_new_plotlines", story_id, db_path)
-        tpl_new_world_rules = get_template("memory_new_world_rules", story_id, db_path)
-        tpl_new_world_lore = get_template("memory_new_world_lore", story_id, db_path)
 
         pack = state.context_pack
         prose = state.chapter_prose
         summary = state.chapter_summary
-        patches = []
 
         def _has_changes(patch, exclude=("entity_type", "entity_id", "source")):
             return any(v is not None for f, v in patch.model_dump().items() if f not in exclude)
@@ -391,194 +602,192 @@ def make_memory_extractor_node(
         def _count_changes(patch, exclude=("entity_type", "entity_id", "source")):
             return sum(1 for f, v in patch.model_dump().items() if f not in exclude and v is not None)
 
-        # --- Characters ---
-        for c in pack.active_characters:
-            print(f"  Extracting memory: {c.name}...")
-            try:
-                raw = _call_llm(model, ollama_client, _character_prompt(c, prose, summary, template=tpl_character))
-                data = _unwrap_envelope(_parse_json(raw))
-                patch = _to_patch(data, CharacterPatch)
-                if patch:
-                    patch = patch.model_copy(update={"entity_id": c.id})  # always force correct id
-                    if _has_changes(patch):
-                        patches.append(patch)
-                        print(f"    → {_count_changes(patch)} field(s) changed")
-                    else:
-                        print(f"    → no changes")
-            except Exception as e:
-                print(f"    [warn] Failed to extract character patch for {c.name}: {e}")
+        # ── Build batch tasks (1 call per entity type) ─────────────────────────
+        active_chars = pack.active_characters
+        active_plots = pack.active_plotlines
+        active_locs  = pack.nearby_locations
 
-        # --- Plotlines ---
-        for p in pack.active_plotlines:
-            print(f"  Extracting memory: plotline '{p.name}'...")
-            try:
-                raw = _call_llm(model, ollama_client, _plotline_prompt(p, prose, summary, template=tpl_plotline))
-                data = _unwrap_envelope(_parse_json(raw))
-                patch = _to_patch(data, PlotlinePatch)
-                if patch:
-                    patch = patch.model_copy(update={"entity_id": p.id})
-                    if _has_changes(patch):
-                        patches.append(patch)
-                        print(f"    → {_count_changes(patch)} field(s) changed")
-                    else:
-                        print(f"    → no changes")
-            except Exception as e:
-                print(f"    [warn] Failed to extract plotline patch for {p.name}: {e}")
-
-        # --- Locations ---
-        for loc in pack.nearby_locations:
-            print(f"  Extracting memory: location '{loc.name}'...")
-            try:
-                raw = _call_llm(model, ollama_client, _location_prompt(loc, prose, summary, template=tpl_location))
-                data = _unwrap_envelope(_parse_json(raw))
-                patch = _to_patch(data, LocationPatch)
-                if patch:
-                    patch = patch.model_copy(update={"entity_id": loc.id})
-                    if _has_changes(patch):
-                        patches.append(patch)
-                        print(f"    → {_count_changes(patch)} field(s) changed")
-                    else:
-                        print(f"    → no changes")
-            except Exception as e:
-                print(f"    [warn] Failed to extract location patch for {loc.name}: {e}")
-
-        # --- POV State ---
+        batch_tasks: list[tuple[str, str, list]] = []  # (kind, prompt, entities)
+        if active_chars:
+            batch_tasks.append(("char", _batch_character_prompt(active_chars, prose, summary), active_chars))
+        if active_plots:
+            batch_tasks.append(("plot", _batch_plotline_prompt(active_plots, prose, summary), active_plots))
+        if active_locs:
+            batch_tasks.append(("loc", _batch_location_prompt(active_locs, prose, summary), active_locs))
         if pack.pov_state:
-            print(f"  Extracting memory: POV state...")
+            batch_tasks.append(("pov", _pov_prompt(pack.pov_state, pack, prose, summary, template=tpl_pov), []))
+
+        # Discovery call (all 5 entity types in one LLM call)
+        existing_char_names  = [e.name for e in pack.character_roster]
+        existing_loc_names   = [l.name for l in _db_module.get_all_locations(state.story_id, db_path)]
+        existing_plot_names  = [p.name for p in _db_module.get_all_plotlines(state.story_id, db_path)]
+        existing_rule_titles = [r.title for r in _db_module.get_all_world_rules(db_path)]
+        existing_lore_titles = [l.title for l in _db_module.get_all_world_lore(db_path)]
+        discovery_prompt = _new_entities_prompt(
+            prose, existing_char_names, existing_loc_names,
+            existing_plot_names, existing_rule_titles, existing_lore_titles,
+        )
+
+        # ── Run all LLM calls in parallel ─────────────────────────────────────
+        total_calls = len(batch_tasks) + 1  # +1 for discovery
+        _p(f"  Running {total_calls} LLM calls in parallel (batch mode)...")
+
+        def _run_batch(kind, prompt, entities):
+            raw = _call_llm(model, ollama_client, prompt, max_tokens=2048)
+            return kind, raw, entities
+
+        def _run_discovery(prompt):
+            return _call_llm(model, ollama_client, prompt, max_tokens=2048)
+
+        patches = []
+        discovery_raw = None
+
+        with ThreadPoolExecutor(max_workers=min(total_calls, 6)) as ex:
+            fut_batches = {
+                ex.submit(_run_batch, kind, prompt, entities): kind
+                for kind, prompt, entities in batch_tasks
+            }
+            fut_discovery = ex.submit(_run_discovery, discovery_prompt)
+
+            for fut in as_completed(fut_batches):
+                kind = fut_batches[fut]
+                try:
+                    _, raw, entities = fut.result()
+                    if kind == "char":
+                        batch = _parse_batch_patches(raw, entities, CharacterPatch)
+                        for patch in batch:
+                            excl = ("entity_type", "entity_id", "source")
+                            if _has_changes(patch, exclude=excl):
+                                patches.append(patch)
+                                _p(f"  char '{patch.entity_id}': {_count_changes(patch, exclude=excl)} field(s) changed")
+                            else:
+                                _p(f"  char '{patch.entity_id}': no changes")
+                    elif kind == "plot":
+                        batch = _parse_batch_patches(raw, entities, PlotlinePatch)
+                        for patch in batch:
+                            excl = ("entity_type", "entity_id", "source")
+                            if _has_changes(patch, exclude=excl):
+                                patches.append(patch)
+                                _p(f"  plot '{patch.entity_id}': {_count_changes(patch, exclude=excl)} field(s) changed")
+                            else:
+                                _p(f"  plot '{patch.entity_id}': no changes")
+                    elif kind == "loc":
+                        batch = _parse_batch_patches(raw, entities, LocationPatch)
+                        for patch in batch:
+                            excl = ("entity_type", "entity_id", "source")
+                            if _has_changes(patch, exclude=excl):
+                                patches.append(patch)
+                                _p(f"  loc '{patch.entity_id}': {_count_changes(patch, exclude=excl)} field(s) changed")
+                            else:
+                                _p(f"  loc '{patch.entity_id}': no changes")
+                    elif kind == "pov":
+                        data = _unwrap_envelope(_parse_json(raw))
+                        patch = _to_patch(data, POVPatch)
+                        if patch:
+                            excl = ("entity_type", "source")
+                            if _has_changes(patch, exclude=excl):
+                                patches.append(patch)
+                                _p(f"  POV state: {_count_changes(patch, exclude=excl)} field(s) changed")
+                            else:
+                                _p("  POV state: no changes")
+                        else:
+                            _p("  POV state: no patch returned")
+                except Exception as e:
+                    _p(f"  [warn] {kind} batch failed: {e}")
+
             try:
-                raw = _call_llm(model, ollama_client, _pov_prompt(pack.pov_state, pack, prose, summary, template=tpl_pov))
-                data = _unwrap_envelope(_parse_json(raw))
-                patch = _to_patch(data, POVPatch)
-                if patch and _has_changes(patch, exclude=("entity_type", "source")):
-                    patches.append(patch)
-                    print(f"    → {_count_changes(patch, exclude=('entity_type','source'))} field(s) changed")
-                else:
-                    print(f"    → no changes")
+                discovery_raw = fut_discovery.result()
             except Exception as e:
-                print(f"    [warn] Failed to extract POV patch: {e}")
+                _p(f"  [warn] Discovery call failed: {e}")
 
-        print(f"  Total patches: {len(patches)}")
+        _p(f"  Total patches: {len(patches)}")
 
-        # --- New entity discovery pass ---
-        print(f"  Scanning for new entities...")
+        # ── Parse discovery results ────────────────────────────────────────────
         new_characters: list[Character] = []
         new_locations: list[Location] = []
         new_plotlines: list[Plotline] = []
         new_world_rules: list[WorldRule] = []
         new_world_lore: list[WorldLore] = []
 
-        import db as _db_module
-        _db = db_path
-        # Use full DB contents so the exclusion list is complete regardless of
-        # what the context builder retrieved this chapter.
-        existing_char_names  = [e.name for e in pack.character_roster]  # roster is always full
-        existing_loc_names   = [l.name for l in _db_module.get_all_locations(state.story_id, _db)]
-        existing_plot_names  = [p.name for p in _db_module.get_all_plotlines(state.story_id, _db)]
-        existing_rule_titles = [r.title for r in _db_module.get_all_world_rules(_db)]
-        existing_lore_titles = [l.title for l in _db_module.get_all_world_lore(_db)]
+        if discovery_raw:
+            _p(f"  Parsing new entity discoveries...")
+            try:
+                disc_data = _parse_json(discovery_raw)
+                if isinstance(disc_data, dict):
+                    for item in disc_data.get("new_characters", []):
+                        try:
+                            c = Character(
+                                name=item.get("name", "Unknown"),
+                                personality=item.get("personality", ""),
+                                goals=item.get("goals") or [],
+                                emotional_state=item.get("emotional_state", ""),
+                                relationships=item.get("relationships") or {},
+                                knowledge=item.get("knowledge") or [],
+                                secrets=item.get("secrets") or [],
+                            )
+                            new_characters.append(c)
+                            _p(f"    + New character: {c.name}")
+                        except Exception as e:
+                            _p(f"    [warn] Could not build character: {e}")
 
-        try:
-            raw = _call_llm(model, ollama_client, _new_characters_prompt(prose, existing_char_names, template=tpl_new_characters))
-            for item in _parse_new_entities(raw):
-                if not isinstance(item, dict) or not item.get("name"):
-                    continue
-                try:
-                    c = Character(
-                        name=item.get("name", "Unknown"),
-                        personality=item.get("personality", ""),
-                        goals=item.get("goals") or [],
-                        emotional_state=item.get("emotional_state", ""),
-                        relationships=item.get("relationships") or {},
-                        knowledge=item.get("knowledge") or [],
-                        secrets=item.get("secrets") or [],
-                    )
-                    new_characters.append(c)
-                    print(f"    + New character: {c.name}")
-                except Exception as e:
-                    print(f"    [warn] Could not build character from discovery: {e}")
-        except Exception as e:
-            print(f"    [warn] New character scan failed: {e}")
+                    for item in disc_data.get("new_locations", []):
+                        try:
+                            loc = Location(
+                                name=item.get("name", "Unknown"),
+                                description=item.get("description", ""),
+                                tone=item.get("tone") or "",
+                                political_control=item.get("political_control"),
+                                secrets=item.get("secrets") or [],
+                                recent_events=item.get("recent_events") or [],
+                            )
+                            new_locations.append(loc)
+                            _p(f"    + New location: {loc.name}")
+                        except Exception as e:
+                            _p(f"    [warn] Could not build location: {e}")
 
-        try:
-            raw = _call_llm(model, ollama_client, _new_locations_prompt(prose, existing_loc_names, template=tpl_new_locations))
-            for item in _parse_new_entities(raw):
-                if not isinstance(item, dict) or not item.get("name"):
-                    continue
-                try:
-                    loc = Location(
-                        name=item.get("name", "Unknown"),
-                        description=item.get("description", ""),
-                        tone=item.get("tone") or "",
-                        political_control=item.get("political_control"),
-                        secrets=item.get("secrets") or [],
-                        recent_events=item.get("recent_events") or [],
-                    )
-                    new_locations.append(loc)
-                    print(f"    + New location: {loc.name}")
-                except Exception as e:
-                    print(f"    [warn] Could not build location from discovery: {e}")
-        except Exception as e:
-            print(f"    [warn] New location scan failed: {e}")
+                    for item in disc_data.get("new_plotlines", []):
+                        try:
+                            pl = Plotline(
+                                name=item.get("name", "Unknown"),
+                                status=item.get("status", "active"),
+                                progress_stage=item.get("progress_stage", ""),
+                                current_tension=int(item.get("current_tension", 5)),
+                                next_possible_developments=item.get("next_possible_developments") or [],
+                            )
+                            new_plotlines.append(pl)
+                            _p(f"    + New plotline: {pl.name}")
+                        except Exception as e:
+                            _p(f"    [warn] Could not build plotline: {e}")
 
-        try:
-            raw = _call_llm(model, ollama_client, _new_plotlines_prompt(prose, existing_plot_names, template=tpl_new_plotlines))
-            for item in _parse_new_entities(raw):
-                if not isinstance(item, dict) or not item.get("name"):
-                    continue
-                try:
-                    p = Plotline(
-                        name=item.get("name", "Unknown"),
-                        status=item.get("status", "active"),
-                        progress_stage=item.get("progress_stage", ""),
-                        current_tension=int(item.get("current_tension", 5)),
-                        next_possible_developments=item.get("next_possible_developments") or [],
-                    )
-                    new_plotlines.append(p)
-                    print(f"    + New plotline: {p.name}")
-                except Exception as e:
-                    print(f"    [warn] Could not build plotline from discovery: {e}")
-        except Exception as e:
-            print(f"    [warn] New plotline scan failed: {e}")
+                    for item in disc_data.get("new_world_rules", []):
+                        try:
+                            r = WorldRule(
+                                rule_type=item.get("rule_type", "hard_constraint"),
+                                title=item.get("title", "Unknown Rule"),
+                                content=item.get("content", ""),
+                            )
+                            new_world_rules.append(r)
+                            _p(f"    + New world rule: {r.title}")
+                        except Exception as e:
+                            _p(f"    [warn] Could not build world rule: {e}")
 
-        try:
-            raw = _call_llm(model, ollama_client, _new_world_rules_prompt(prose, existing_rule_titles, template=tpl_new_world_rules))
-            for item in _parse_new_entities(raw):
-                if not isinstance(item, dict) or not item.get("title"):
-                    continue
-                try:
-                    r = WorldRule(
-                        rule_type=item.get("rule_type", "hard_constraint"),
-                        title=item.get("title", "Unknown Rule"),
-                        content=item.get("content", ""),
-                    )
-                    new_world_rules.append(r)
-                    print(f"    + New world rule: {r.title}")
-                except Exception as e:
-                    print(f"    [warn] Could not build world rule from discovery: {e}")
-        except Exception as e:
-            print(f"    [warn] New world rule scan failed: {e}")
-
-        try:
-            raw = _call_llm(model, ollama_client, _new_world_lore_prompt(prose, existing_lore_titles, template=tpl_new_world_lore))
-            for item in _parse_new_entities(raw):
-                if not isinstance(item, dict) or not item.get("title"):
-                    continue
-                try:
-                    l = WorldLore(
-                        category=item.get("category", "canon_fact"),
-                        title=item.get("title", "Unknown Lore"),
-                        content=item.get("content", ""),
-                    )
-                    new_world_lore.append(l)
-                    print(f"    + New lore: {l.title}")
-                except Exception as e:
-                    print(f"    [warn] Could not build world lore from discovery: {e}")
-        except Exception as e:
-            print(f"    [warn] New world lore scan failed: {e}")
+                    for item in disc_data.get("new_world_lore", []):
+                        try:
+                            l = WorldLore(
+                                category=item.get("category", "canon_fact"),
+                                title=item.get("title", "Unknown Lore"),
+                                content=item.get("content", ""),
+                            )
+                            new_world_lore.append(l)
+                            _p(f"    + New lore: {l.title}")
+                        except Exception as e:
+                            _p(f"    [warn] Could not build world lore: {e}")
+            except Exception as e:
+                _p(f"  [warn] Discovery parse failed: {e}")
 
         total_new = len(new_characters) + len(new_locations) + len(new_plotlines) + \
                     len(new_world_rules) + len(new_world_lore)
-        print(f"  New entities discovered: {total_new}")
+        _p(f"  New entities discovered: {total_new}")
 
         return {
             "memory_patches": patches,

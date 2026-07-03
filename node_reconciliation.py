@@ -209,14 +209,16 @@ def reconcile(state: ChapterGraphState) -> dict:
     }
 
 
-def make_reconciliation_node():
+def make_reconciliation_node(print_fn=print):
+    _p = print_fn
+
     def node(state: ChapterGraphState) -> dict:
         result = reconcile(state)
         n_conflicts = len(result["reconciliation_conflicts"])
         n_patches = len(result["reconciled_patches"])
-        print(f"  {n_patches} reconciled patch(es), {n_conflicts} conflict(s) resolved")
+        _p(f"  {n_patches} reconciled patch(es), {n_conflicts} conflict(s) resolved")
         for c in result["reconciliation_conflicts"]:
-            print(f"    [resolved] {c.description}")
+            _p(f"    [resolved] {c.description}")
         return result
     return node
 

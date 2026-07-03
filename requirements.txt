@@ -5,6 +5,9 @@ openai>=1.0
 
 # Structured-output resilience for small local models
 json-repair>=0.25
+# Validated structured output — re-asks the model until the object matches the
+# Pydantic schema (used by node_combined_check via llm_client.chat_structured)
+instructor>=1.5
 
 # Data models / validation
 pydantic>=2.0

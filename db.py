@@ -26,7 +26,9 @@ whole chapter atomically; node_context_builder.py reuses one connection for its
 dozen-plus reads instead of opening a fresh one each time). When omitted, each
 call opens/commits/closes its own connection exactly as before.
 """
+import shutil
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -36,6 +38,8 @@ from schema import (
 )
 
 DB_PATH = Path(__file__).parent / "novelgen.db"
+
+BACKUP_RETENTION = 10  # keep the last N snapshots in backups/
 
 
 def _conn_and_owned(db_path: Optional[Path], conn: Optional[sqlite3.Connection]):
@@ -169,6 +173,25 @@ def init_db(db_path: Optional[Path] = None) -> None:
             name TEXT NOT NULL,
             template TEXT NOT NULL,
             PRIMARY KEY (story_id, name)
+        )""",
+        """CREATE TABLE IF NOT EXISTS stories (
+            story_id TEXT PRIMARY KEY,
+            book_title TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""",
+        """CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )""",
+        # In-flight chapter checkpoint: full pipeline state serialized after each
+        # completed node, so a crash mid-chapter resumes instead of restarting.
+        # One row per story — only one chapter generates at a time.
+        """CREATE TABLE IF NOT EXISTS chapter_checkpoints (
+            story_id TEXT PRIMARY KEY,
+            chapter_number INTEGER NOT NULL,
+            last_stage TEXT NOT NULL,
+            state_json TEXT NOT NULL,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )""",
         # story_id is the hot filter on nearly every read but isn't a PK on
         # these tables — index it so lookups stay O(log n) as a story grows.
@@ -464,6 +487,201 @@ def upsert_prompt_override(name: str, story_id: str, template: str, db_path: Opt
 
 def delete_prompt_override(name: str, story_id: str, db_path: Optional[Path] = None, conn=None) -> None:
     _write("DELETE FROM prompt_overrides WHERE story_id = ? AND name = ?", (story_id, name), db_path, conn)
+
+
+# ---------------------------------------------------------------------------
+# Stories registry (GUI story switcher)
+# ---------------------------------------------------------------------------
+
+def create_story(story_id: str, book_title: str, db_path: Optional[Path] = None, conn=None) -> None:
+    """Register a story so the GUI can list/switch to it. Idempotent — updates
+    the title if the story already exists."""
+    _write("INSERT OR REPLACE INTO stories (story_id, book_title) VALUES (?, ?)",
+           (story_id, book_title), db_path, conn)
+
+
+def get_story_title(story_id: str, db_path: Optional[Path] = None, conn=None) -> Optional[str]:
+    row = _fetch_one("SELECT book_title FROM stories WHERE story_id = ?", (story_id,), db_path, conn)
+    return row["book_title"] if row else None
+
+
+def list_stories(db_path: Optional[Path] = None, conn=None) -> List[dict]:
+    """Return [{story_id, book_title}, ...]. Includes any story that has chapters
+    but was never registered (older DBs), so nothing gets orphaned."""
+    rows = _fetch_all(
+        """SELECT s.story_id AS story_id, s.book_title AS book_title
+             FROM stories s
+           UNION
+           SELECT c.story_id AS story_id, c.story_id AS book_title
+             FROM chapters c
+            WHERE c.story_id NOT IN (SELECT story_id FROM stories)
+           ORDER BY book_title COLLATE NOCASE""",
+        (), db_path, conn,
+    )
+    return [{"story_id": r["story_id"], "book_title": r["book_title"]} for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# App settings (global key/value, e.g. the selected generation model)
+# ---------------------------------------------------------------------------
+
+def get_setting(key: str, default: Optional[str] = None, db_path: Optional[Path] = None, conn=None) -> Optional[str]:
+    row = _fetch_one("SELECT value FROM app_settings WHERE key = ?", (key,), db_path, conn)
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str, db_path: Optional[Path] = None, conn=None) -> None:
+    _write("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)", (key, value), db_path, conn)
+
+
+# ---------------------------------------------------------------------------
+# Database backups (full-file snapshots in backups/, used by the GUI + pipeline)
+#
+# ---------------------------------------------------------------------------
+# Chapter checkpoints — crash recovery for an in-flight chapter.
+# pipeline.run_chapter saves the full serialized ChapterGraphState here after
+# every completed node; on the next run it resumes from the last completed
+# node instead of regenerating the whole chapter. Deleted when the chapter
+# finishes normally or the user cancels deliberately.
+# ---------------------------------------------------------------------------
+
+_SAVE_CHECKPOINT_SQL = """INSERT INTO chapter_checkpoints (story_id, chapter_number, last_stage, state_json, updated_at)
+           VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(story_id) DO UPDATE SET
+             chapter_number = excluded.chapter_number,
+             last_stage = excluded.last_stage,
+             state_json = excluded.state_json,
+             updated_at = CURRENT_TIMESTAMP"""
+
+
+def save_chapter_checkpoint(
+    story_id: str, chapter_number: int, last_stage: str, state_json: str,
+    db_path: Optional[Path] = None, conn=None,
+) -> None:
+    if conn is not None:
+        _write(_SAVE_CHECKPOINT_SQL, (story_id, chapter_number, last_stage, state_json), db_path, conn)
+        return
+    # This row exists to survive the machine dying — synchronous=NORMAL (the
+    # connection default, see get_connection) lets a power loss / hard crash
+    # discard recently committed WAL frames, which is precisely when the
+    # checkpoint is needed. FULL fsyncs this commit to disk; one fsync per
+    # pipeline node is noise next to the minutes each LLM call takes.
+    _conn = get_connection(db_path)
+    try:
+        _conn.execute("PRAGMA synchronous=FULL")
+        _conn.execute(_SAVE_CHECKPOINT_SQL, (story_id, chapter_number, last_stage, state_json))
+        _conn.commit()
+    finally:
+        _conn.close()
+
+
+def get_chapter_checkpoint(story_id: str, db_path: Optional[Path] = None, conn=None) -> Optional[dict]:
+    row = _fetch_one(
+        "SELECT chapter_number, last_stage, state_json FROM chapter_checkpoints WHERE story_id = ?",
+        (story_id,), db_path, conn,
+    )
+    if row is None:
+        return None
+    return {
+        "chapter_number": row["chapter_number"],
+        "last_stage": row["last_stage"],
+        "state_json": row["state_json"],
+    }
+
+
+def delete_chapter_checkpoint(story_id: str, db_path: Optional[Path] = None, conn=None) -> None:
+    _write("DELETE FROM chapter_checkpoints WHERE story_id = ?", (story_id,), db_path, conn)
+
+
+# ---------------------------------------------------------------------------
+# A snapshot is a copy of the whole SQLite file, so it covers ALL stories at
+# once — restoring rolls the entire database back to that point. Filenames are
+# {stem}_{tag}_{YYYYmmdd_HHMMSS}.db where tag is "ch<N>" (auto, before a chapter),
+# "manual", or "prerestore" (the safety copy taken before a restore).
+# ---------------------------------------------------------------------------
+
+def _backups_dir(db_path: Optional[Path]) -> Path:
+    base = db_path if db_path is not None else DB_PATH
+    return base.parent / "backups"
+
+
+def _pretty_tag(tag: str) -> str:
+    if tag.startswith("ch") and tag[2:].isdigit():
+        return f"Chapter {tag[2:]}"
+    return tag.replace("prerestore", "Pre-restore").capitalize()
+
+
+def list_backups(db_path: Optional[Path] = None) -> List[dict]:
+    """Snapshots for this DB, newest first: {path, tag, label, when, size_kb}."""
+    base = db_path if db_path is not None else DB_PATH
+    d = _backups_dir(base)
+    if not d.exists():
+        return []
+    out = []
+    for p in d.glob(f"{base.stem}_*.db"):
+        rest = p.stem[len(base.stem) + 1:]        # strip "<stem>_"
+        tag = rest.split("_", 1)[0]               # "ch3" / "manual" / "prerestore"
+        st = p.stat()
+        out.append({
+            "path": p,
+            "tag": tag,
+            "label": _pretty_tag(tag),
+            "when": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            "size_kb": max(1, st.st_size // 1024),
+            "mtime": st.st_mtime,
+        })
+    out.sort(key=lambda b: b["mtime"], reverse=True)
+    return out
+
+
+def _prune_backups(base: Path) -> None:
+    existing = sorted(_backups_dir(base).glob(f"{base.stem}_*.db"), key=lambda p: p.stat().st_mtime)
+    for stale in existing[:-BACKUP_RETENTION]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def create_backup(db_path: Optional[Path] = None, tag: str = "manual") -> Optional[Path]:
+    """Checkpoint the WAL (so the copy has every committed change) and snapshot
+    the DB into backups/, pruning to BACKUP_RETENTION. Returns the new path."""
+    base = db_path if db_path is not None else DB_PATH
+    if not base.exists():
+        return None
+    d = _backups_dir(base)
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        conn = get_connection(base)
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+    except sqlite3.Error:
+        pass  # checkpoint is best-effort; copy still proceeds
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = d / f"{base.stem}_{tag}_{stamp}.db"
+    shutil.copy2(base, dest)
+    _prune_backups(base)
+    return dest
+
+
+def restore_backup(backup_path, db_path: Optional[Path] = None) -> None:
+    """Overwrite the live DB with a snapshot. Saves the current DB first (as a
+    'prerestore' snapshot) and clears WAL sidecars so SQLite can't replay stale
+    frames onto the restored file."""
+    base = db_path if db_path is not None else DB_PATH
+    backup_path = Path(backup_path)
+    if not backup_path.exists():
+        raise FileNotFoundError(backup_path)
+    if base.exists():
+        create_backup(base, tag="prerestore")
+    for suffix in ("-wal", "-shm"):
+        side = base.parent / (base.name + suffix)
+        if side.exists():
+            try:
+                side.unlink()
+            except OSError:
+                pass
+    shutil.copy2(backup_path, base)
 
 
 if __name__ == "__main__":

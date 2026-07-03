@@ -33,7 +33,6 @@ import db
 # ---------------------------------------------------------------------------
 
 PROMPT_REGISTRY: list[tuple[str, str, str]] = [
-    ("Input Router", "input_router_classification", "Classify continuation vs. a user-injected plot event"),
     ("Outline Manager", "outline_init", "Generate the initial story outline (cold start)"),
     ("Outline Manager", "outline_revision", "Periodic full outline rewrite"),
     ("Story Planner", "story_planner", "Plan the chapter (scenes, conflicts, constraints, length)"),
@@ -65,16 +64,6 @@ PROMPT_KEYS: set[str] = {key for _, key, _ in PROMPT_REGISTRY}
 # ---------------------------------------------------------------------------
 
 DEFAULT_TEMPLATES: dict[str, str] = {
-
-    "input_router_classification": """Given this user input to a chapter-generation system, classify whether it is:
-  (a) "continuation" — a generic request to continue the story with no specific new event
-      (e.g. "continue", "write the next chapter", "what happens next", "go on")
-  (b) "user_event_injection" — an explicit instruction that should be treated as a forced
-      plot event this chapter (e.g. introducing a new character, forcing an action or
-      encounter, changing a character's state directly, or otherwise steering the plot
-      in a specific direction)
-
-USER INPUT: "{user_input}\"""",
 
     "outline_init": """You are a story architect creating a high-level outline for a new novel before writing begins.
 This outline will guide chapter-by-chapter planning for the whole book — think in terms of the entire arc, not just the opening.

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from llm_client import MODEL, chat_json
+from llm_client import chat_json
 from schema import CraftCheckResult, ChapterGraphState, ContextPack, StoryPlan
 
 
@@ -106,7 +106,7 @@ def _parse_check_result(data: dict) -> CraftCheckResult:
 # ---------------------------------------------------------------------------
 
 def make_craft_check_node(
-    model: str = MODEL,
+    model: Optional[str] = None,
     ollama_client=None,
     db_path=None,
 ) -> Callable[[ChapterGraphState], CraftCheckResult]:

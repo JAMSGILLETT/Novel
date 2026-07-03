@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from llm_client import MODEL, chat_json
+from llm_client import chat_json
 from schema import (
     CanonCheckResult, ChapterGraphState, ContextPack, StoryPlan,
 )
@@ -162,7 +162,7 @@ def _parse_check_result(data: dict) -> CanonCheckResult:
 # ---------------------------------------------------------------------------
 
 def make_canon_check_node(
-    model: str = MODEL,
+    model: Optional[str] = None,
     ollama_client=None,
     db_path=None,
 ) -> Callable[[ChapterGraphState], CanonCheckResult]:

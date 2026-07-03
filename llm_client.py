@@ -27,8 +27,30 @@ from typing import Any, List, Optional, Union
 DEFAULT_MODEL = "qwen2.5:14b-instruct-q4_K_M"
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 
-# Override the model at runtime without touching code:  set NOVELGEN_MODEL=...
-MODEL = os.environ.get("NOVELGEN_MODEL", DEFAULT_MODEL)
+# The active model, resolved at call time (not import time) so the GUI Settings
+# tab can change it live. Seeded from NOVELGEN_MODEL, then get_model()/set_model()
+# own it. `MODEL` remains as a back-compat alias of the initial value.
+_current_model = os.environ.get("NOVELGEN_MODEL", DEFAULT_MODEL)
+MODEL = _current_model
+
+
+def get_model() -> str:
+    """The model every node uses unless one is passed explicitly."""
+    return _current_model
+
+
+def set_model(name: str) -> None:
+    """Switch the active model for all subsequent LLM calls. Empty → default."""
+    global _current_model
+    _current_model = (name or "").strip() or DEFAULT_MODEL
+
+
+def list_installed_models(client: Optional[Any] = None) -> List[str]:
+    """Model ids Ollama currently has pulled (via the OpenAI-compatible
+    /models endpoint). Raises if Ollama isn't reachable."""
+    resp = get_client(client).models.list()
+    return sorted(m.id for m in resp.data)
+
 
 # How long Ollama should keep the model loaded after a request. Keeping it warm
 # across a chapter's calls avoids repeated multi-second weight reloads.
@@ -52,7 +74,7 @@ def get_client(client: Optional[Any] = None):
 def chat(
     prompt: Union[str, List[dict]],
     *,
-    model: str = MODEL,
+    model: Optional[str] = None,
     max_tokens: int = 2048,
     timeout: int = 600,
     response_format: Optional[dict] = None,
@@ -66,9 +88,11 @@ def chat(
     """One chat completion with exponential-backoff retry.
 
     `prompt` may be a plain string (wrapped as a single user message) or a
-    ready-made messages list. Returns the raw response object.
+    ready-made messages list. `model=None` uses the active model (get_model()),
+    so the GUI can switch models live. Returns the raw response object.
     """
     c = get_client(client)
+    model = model or get_model()
     messages = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else prompt
 
     kwargs: dict = {
@@ -98,6 +122,60 @@ def chat(
             time.sleep(wait)
 
 
+_instructor_client = None
+
+
+def get_instructor_client(client: Optional[Any] = None):
+    """OpenAI client patched by Instructor for validated structured output.
+
+    Uses JSON mode (not tool-calling) because Ollama's tool support is uneven
+    across small models, whereas json_object is broadly honored. The underlying
+    client is the same shared singleton chat() uses, so keep_alive/base_url are
+    unchanged. Tests can still inject a fake via `client`."""
+    import instructor
+
+    if client is not None:
+        return instructor.from_openai(client, mode=instructor.Mode.JSON)
+    global _instructor_client
+    if _instructor_client is None:
+        _instructor_client = instructor.from_openai(get_client(), mode=instructor.Mode.JSON)
+    return _instructor_client
+
+
+def chat_structured(
+    prompt: Union[str, List[dict]],
+    response_model,
+    *,
+    model: Optional[str] = None,
+    max_tokens: int = 2048,
+    timeout: int = 600,
+    client: Optional[Any] = None,
+    max_retries: int = 3,
+    label: str = "Structured",
+    print_fn=print,
+):
+    """chat() for a validated Pydantic model. Returns an instance of
+    `response_model`, re-asking the model up to `max_retries` times if its
+    output doesn't validate (truncated JSON, wrong types, missing fields).
+
+    Unlike chat_json(), an incomplete response can't slip through as a default
+    'passed' object — validation failure surfaces as an exception the caller
+    (or Instructor's own retry) handles, instead of a silent fallback."""
+    ic = get_instructor_client(client)
+    model = model or get_model()
+    messages = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else prompt
+
+    return ic.chat.completions.create(
+        model=model,
+        max_tokens=max_tokens,
+        timeout=timeout,
+        messages=messages,
+        response_model=response_model,
+        max_retries=max_retries,
+        extra_body={"keep_alive": KEEP_ALIVE},
+    )
+
+
 def chat_text(prompt: Union[str, List[dict]], **kwargs) -> str:
     """chat() convenience for plain-text prose responses (writer, summaries)."""
     response = chat(prompt, **kwargs)
@@ -108,7 +186,7 @@ def chat_json(
     prompt: Union[str, List[dict]],
     *,
     label: str = "response",
-    model: str = MODEL,
+    model: Optional[str] = None,
     max_tokens: int = 2048,
     timeout: int = 600,
     client: Optional[Any] = None,

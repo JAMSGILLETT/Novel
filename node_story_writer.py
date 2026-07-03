@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import db
-from llm_client import MODEL, chat_text
+from llm_client import chat_text
 from schema import (
     Character, CharacterReasoning, ChapterGraphState, ContextPack, StoryPlan,
 )
@@ -249,10 +249,12 @@ def build_writer_prompt(
 # ---------------------------------------------------------------------------
 
 def make_story_writer_node(
-    model: str = MODEL,
+    model: Optional[str] = None,
     ollama_client=None,
     db_path: Optional[Path] = None,
+    print_fn=print,
 ) -> Callable[[ChapterGraphState], dict]:
+    _p = print_fn
 
     def node(
         state: ChapterGraphState,
@@ -276,7 +278,7 @@ def make_story_writer_node(
         target = state.story_plan.target_word_count if state.story_plan else 1000
         MIN_WORDS = int(target * 0.7)  # continuation-trigger floor — below this, ask for more
         if len(prose.split()) < MIN_WORDS:
-            print(f"  [writer] Output too short ({len(prose.split())} words) — requesting continuation...")
+            _p(f"  [writer] Output too short ({len(prose.split())} words) — requesting continuation...")
             continuation_prompt = (
                 f"Continue the chapter from exactly where it left off. "
                 f"Write at least 400 more words. "
@@ -291,7 +293,7 @@ def make_story_writer_node(
                 if continuation:
                     prose = prose + "\n\n" + continuation
             except Exception as e:
-                print(f"  [writer] Continuation failed (using short version): {e}")
+                _p(f"  [writer] Continuation failed (using short version): {e}")
 
         return {"chapter_prose": prose}
 

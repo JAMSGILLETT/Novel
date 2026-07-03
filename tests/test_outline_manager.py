@@ -10,6 +10,7 @@ import db as db_module
 from node_outline_manager import (
     OUTLINE_REVISION_INTERVAL,
     apply_mechanical_outline_updates,
+    make_outline_manager_node,
     maybe_revise_outline,
 )
 from schema import (
@@ -88,6 +89,54 @@ def test_mechanical_update_is_a_noop_when_nothing_changed(tmp_db_path):
 
     reloaded = db_module.get_story_outline(story_id, tmp_db_path)
     assert reloaded.premise == "Original premise"
+
+
+def test_hand_authored_premise_gets_beats_on_cold_start(tmp_db_path, fake_ollama_json):
+    """An outline created in the World Bible tab (premise but no beats) must
+    still trigger beat generation on cold start — keeping the author's premise."""
+    story_id = "s1"
+    db_module.upsert_story_outline(
+        StoryOutline(story_id=story_id, premise="My hand-written premise", theme="Loyalty"),
+        tmp_db_path,
+    )
+    client = fake_ollama_json({
+        "premise": "LLM-invented premise that must NOT win",
+        "theme": "LLM theme",
+        "planned_ending": "Generated ending",
+        "beats": [{"description": "Generated beat"}],
+        "character_arcs": [],
+    })
+    node = make_outline_manager_node(ollama_client=client, db_path=tmp_db_path)
+    state = ChapterGraphState(story_id=story_id, chapter_number=1, user_input="go", input_mode="cold_start")
+
+    outline = node(state)["story_outline"]
+    assert outline.premise == "My hand-written premise"
+    assert outline.theme == "Loyalty"
+    assert outline.planned_ending == "Generated ending"  # author left it blank — LLM fills it
+    assert len(outline.beats) == 1
+    # persisted, so the next run loads it without another LLM call
+    assert db_module.get_story_outline(story_id, tmp_db_path).premise == "My hand-written premise"
+
+
+def test_existing_outline_loads_without_llm_mid_story(tmp_db_path):
+    """Mid-story (continuation), an outline is loaded as-is even without beats."""
+    story_id = "s1"
+    db_module.upsert_story_outline(StoryOutline(story_id=story_id, premise="Edited mid-story"), tmp_db_path)
+    node = make_outline_manager_node(ollama_client=_ExplodingClient(), db_path=tmp_db_path)
+    state = ChapterGraphState(story_id=story_id, chapter_number=5, user_input="x", input_mode="continuation")
+    assert node(state)["story_outline"].premise == "Edited mid-story"
+
+
+def test_seeded_outline_with_beats_loads_without_llm_on_cold_start(tmp_db_path):
+    """Seed scripts pre-create full outlines (with beats) — no LLM init call."""
+    story_id = "s1"
+    db_module.upsert_story_outline(
+        StoryOutline(story_id=story_id, premise="Seeded", beats=[StoryBeat(description="b1")]),
+        tmp_db_path,
+    )
+    node = make_outline_manager_node(ollama_client=_ExplodingClient(), db_path=tmp_db_path)
+    state = ChapterGraphState(story_id=story_id, chapter_number=1, user_input="x", input_mode="cold_start")
+    assert node(state)["story_outline"].premise == "Seeded"
 
 
 def test_revision_skipped_off_interval_boundary(tmp_db_path):

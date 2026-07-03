@@ -40,10 +40,11 @@ def _apply_character_patch(
     patch: CharacterPatch,
     story_id: str,
     db_path: Optional[Path],
+    _p=print,
 ) -> Optional[Character]:
     c = db.get_character_by_id(patch.entity_id, story_id, db_path)
     if c is None:
-        print(f"    [warn] Character {patch.entity_id} not found in DB — skipping patch")
+        _p(f"    [warn] Character {patch.entity_id} not found in DB — skipping patch")
         return None
 
     updates: dict = {}
@@ -80,10 +81,11 @@ def _apply_plotline_patch(
     story_id: str,
     db_path: Optional[Path],
     chapter_number: int,
+    _p=print,
 ) -> Optional[Plotline]:
     p = db.get_plotline_by_id(patch.entity_id, story_id, db_path)
     if p is None:
-        print(f"    [warn] Plotline {patch.entity_id} not found in DB — skipping patch")
+        _p(f"    [warn] Plotline {patch.entity_id} not found in DB — skipping patch")
         return None
 
     updates: dict = {}
@@ -109,10 +111,11 @@ def _apply_location_patch(
     patch: LocationPatch,
     story_id: str,
     db_path: Optional[Path],
+    _p=print,
 ) -> Optional[Location]:
     loc = db.get_location_by_id(patch.entity_id, story_id, db_path)
     if loc is None:
-        print(f"    [warn] Location {patch.entity_id} not found in DB — skipping patch")
+        _p(f"    [warn] Location {patch.entity_id} not found in DB — skipping patch")
         return None
 
     updates: dict = {}
@@ -139,10 +142,11 @@ def _apply_pov_patch(
     patch: POVPatch,
     story_id: str,
     db_path: Optional[Path],
+    _p=print,
 ) -> Optional[POVState]:
     pov = db.get_pov_state(story_id, db_path)
     if pov is None:
-        print(f"    [warn] POV state not found in DB — skipping patch")
+        _p(f"    [warn] POV state not found in DB — skipping patch")
         return None
 
     updates: dict = {}
@@ -177,7 +181,9 @@ def make_persistence_node(
     chroma_client=None,
     embedder=None,
     db_path: Optional[Path] = None,
+    print_fn=print,
 ) -> Callable[[ChapterGraphState], dict]:
+    _p = print_fn
 
     def _chroma():
         if chroma_client is not None:
@@ -204,63 +210,63 @@ def make_persistence_node(
             # --- Apply reconciled patches ---
             for patch in state.reconciled_patches:
                 if isinstance(patch, CharacterPatch):
-                    updated = _apply_character_patch(patch, story_id, _db)
+                    updated = _apply_character_patch(patch, story_id, _db, _p=_p)
                     if updated:
                         db.upsert_character(updated, story_id, _db, conn=conn)
                         embed_and_upsert("character", updated.id, vs.character_text(updated), sid=story_id)
-                        print(f"    Persisted character: {updated.name}")
+                        _p(f"    Persisted character: {updated.name}")
 
                 elif isinstance(patch, PlotlinePatch):
-                    updated = _apply_plotline_patch(patch, story_id, _db, state.chapter_number)
+                    updated = _apply_plotline_patch(patch, story_id, _db, state.chapter_number, _p=_p)
                     if updated:
                         db.upsert_plotline(updated, story_id, _db, conn=conn)
                         embed_and_upsert("plotline", updated.id, vs.plotline_text(updated), sid=story_id)
-                        print(f"    Persisted plotline: {updated.name}")
+                        _p(f"    Persisted plotline: {updated.name}")
 
                 elif isinstance(patch, LocationPatch):
-                    updated = _apply_location_patch(patch, story_id, _db)
+                    updated = _apply_location_patch(patch, story_id, _db, _p=_p)
                     if updated:
                         db.upsert_location(updated, story_id, _db, conn=conn)
                         embed_and_upsert("location", updated.id, vs.location_text(updated), sid=story_id)
-                        print(f"    Persisted location: {updated.name}")
+                        _p(f"    Persisted location: {updated.name}")
 
                 elif isinstance(patch, POVPatch):
-                    updated = _apply_pov_patch(patch, story_id, _db)
+                    updated = _apply_pov_patch(patch, story_id, _db, _p=_p)
                     if updated:
                         db.upsert_pov_state(updated, story_id, _db, conn=conn)
-                        print(f"    Persisted POV state")
+                        _p(f"    Persisted POV state")
 
             # --- Persist newly discovered entities ---
             for c in state.new_characters:
                 db.upsert_character(c, story_id, _db, conn=conn)
                 embed_and_upsert("character", c.id, vs.character_text(c), sid=story_id)
-                print(f"    Created new character: {c.name}")
+                _p(f"    Created new character: {c.name}")
 
             for loc in state.new_locations:
                 db.upsert_location(loc, story_id, _db, conn=conn)
                 embed_and_upsert("location", loc.id, vs.location_text(loc), sid=story_id)
-                print(f"    Created new location: {loc.name}")
+                _p(f"    Created new location: {loc.name}")
 
             for p in state.new_plotlines:
                 p = p.model_copy(update={"last_touched_chapter": state.chapter_number})
                 db.upsert_plotline(p, story_id, _db, conn=conn)
                 embed_and_upsert("plotline", p.id, vs.plotline_text(p), sid=story_id)
-                print(f"    Created new plotline: {p.name}")
+                _p(f"    Created new plotline: {p.name}")
 
             for r in state.new_world_rules:
                 db.upsert_world_rule(r, _db, conn=conn)
                 embed_and_upsert("world_rule", r.id, vs.world_rule_text(r))
-                print(f"    Created new world rule: {r.title}")
+                _p(f"    Created new world rule: {r.title}")
 
             for l in state.new_world_lore:
                 db.upsert_world_lore(l, _db, conn=conn)
                 embed_and_upsert("world_lore", l.id, vs.world_lore_text(l))
-                print(f"    Created new world lore: {l.title}")
+                _p(f"    Created new world lore: {l.title}")
 
             # --- Persist chapter summary ---
             if state.chapter_summary:
                 db.upsert_chapter_summary(state.chapter_summary, story_id, _db, conn=conn)
-                print(f"    Persisted chapter {state.chapter_summary.chapter_number} summary")
+                _p(f"    Persisted chapter {state.chapter_summary.chapter_number} summary")
 
             # --- Mechanical outline updates (new beats/arcs, completed beats) ---
             from node_outline_manager import apply_mechanical_outline_updates
@@ -273,7 +279,7 @@ def make_persistence_node(
             )
 
             conn.commit()
-            print(f"    Registered chapter {state.chapter_number}")
+            _p(f"    Registered chapter {state.chapter_number}")
         except Exception:
             conn.rollback()
             raise

@@ -254,6 +254,23 @@ class CraftCheckResult(BaseModel):
     issues: list[CraftIssue] = Field(default_factory=list)
 
 
+class CombinedCheckResult(BaseModel):
+    """Single-call canon + craft verdict. Used by node_combined_check when it
+    asks the model (via Instructor) for a validated result in one shot — the
+    model can't return a truncated JSON that silently reads as 'passed', because
+    Instructor re-asks until the whole object validates against this schema."""
+    canon_passed: bool
+    violations: list[CanonViolation] = Field(default_factory=list)
+    craft_passed: bool
+    issues: list[CraftIssue] = Field(default_factory=list)
+
+    def split(self) -> "tuple[CanonCheckResult, CraftCheckResult]":
+        return (
+            CanonCheckResult(passed=self.canon_passed, violations=self.violations),
+            CraftCheckResult(passed=self.craft_passed, issues=self.issues),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Story outline: premise/theme/beats/character arcs, revisited periodically
 # ---------------------------------------------------------------------------
@@ -412,7 +429,7 @@ MAX_CRAFT_CHECK_RETRIES = 1  # craft is subjective — cap revisions tighter tha
 class ChapterGraphState(BaseModel):
     story_id: str
     chapter_number: int
-    input_mode: Optional[Literal["cold_start", "continuation", "user_event_injection"]] = None
+    input_mode: Optional[Literal["cold_start", "continuation"]] = None
     user_input: str
 
     retrieval_config: RetrievalConfig = Field(default_factory=RetrievalConfig)

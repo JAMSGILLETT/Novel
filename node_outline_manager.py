@@ -7,7 +7,8 @@ re-deriving direction from the rolling summary chapter to chapter.
 
 Three separate responsibilities, run at three different points in the pipeline:
 
-  make_outline_manager_node() — runs early, right after Node 1 (Input Router).
+  make_outline_manager_node() — runs early, right after the chapter number and
+    mode are determined from the DB at the top of run_chapter.
     Cold start: one LLM call generates the initial outline from world rules/
     lore, any pre-seeded characters, and the user's opening directive.
     Continuation: just loads the existing outline (cheap DB read, no LLM call).
@@ -34,7 +35,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import db
-from llm_client import MODEL, chat
+from llm_client import chat
 from llm_json import parse_json_response
 from node_story_planner import full_history_text
 from prompt_templates import get_template
@@ -77,6 +78,7 @@ _INIT_TEMPLATE = """
 def _build_init_prompt(
     user_input: str, world_rules: list, world_lore: list, characters: list,
     template: Optional[str] = None,
+    seed_outline: Optional[StoryOutline] = None,
 ) -> str:
     from prompt_templates import DEFAULT_TEMPLATES
     tpl = template if template is not None else DEFAULT_TEMPLATES["outline_init"]
@@ -85,9 +87,28 @@ def _build_init_prompt(
     lore_text = "\n".join(f"  • [{l.category}] {l.title}: {l.content}" for l in world_lore) or "  (none yet)"
     chars_text = "\n".join(f"  • [{c.id}] {c.name}: {c.personality}" for c in characters) or "  (none pre-established — this is a blank slate)"
 
-    return tpl.format(
+    prompt = tpl.format(
         user_input=user_input, rules_text=rules_text, lore_text=lore_text, chars_text=chars_text,
-    ) + _INIT_TEMPLATE
+    )
+
+    # Author-fixed direction (hand-edited in the World Bible tab before chapter 1):
+    # the LLM designs beats/arcs around it instead of inventing its own premise.
+    if seed_outline is not None:
+        fixed = []
+        if seed_outline.premise.strip():
+            fixed.append(f"  Premise: {seed_outline.premise.strip()}")
+        if seed_outline.theme.strip():
+            fixed.append(f"  Theme: {seed_outline.theme.strip()}")
+        if seed_outline.planned_ending.strip():
+            fixed.append(f"  Planned ending: {seed_outline.planned_ending.strip()}")
+        if fixed:
+            prompt += (
+                "\n\nThe author has already decided the following story-level direction. "
+                "Treat it as fixed: repeat it verbatim in your output and design the "
+                "beats and character arcs around it.\n" + "\n".join(fixed)
+            )
+
+    return prompt + _INIT_TEMPLATE
 
 
 _INIT_DEFAULTS = {"premise": "", "theme": "", "planned_ending": "", "beats": [], "character_arcs": []}
@@ -121,7 +142,7 @@ def _parse_init_outline(raw_content: str, story_id: str) -> StoryOutline:
 
 
 def make_outline_manager_node(
-    model: str = MODEL,
+    model: Optional[str] = None,
     ollama_client=None,
     db_path: Optional[Path] = None,
 ) -> Callable[[ChapterGraphState], dict]:
@@ -130,17 +151,30 @@ def make_outline_manager_node(
 
     def node(state: ChapterGraphState) -> dict:
         existing = db.get_story_outline(state.story_id, db_path)
+        # A hand-authored outline (World Bible tab) that has no beats yet, on a
+        # story with no chapters: keep the author's premise/theme/ending but
+        # still generate beats and arcs around them. Anything else loads as-is.
+        seed = None
         if existing is not None:
-            return {"story_outline": existing}
+            if existing.beats or state.input_mode != "cold_start":
+                return {"story_outline": existing}
+            seed = existing
 
         characters = db.get_all_characters(state.story_id, db_path)
         world_rules = db.get_all_world_rules(db_path)
         world_lore = db.get_all_world_lore(db_path)
 
         template = get_template("outline_init", state.story_id, db_path)
-        prompt = _build_init_prompt(state.user_input, world_rules, world_lore, characters, template=template)
+        prompt = _build_init_prompt(state.user_input, world_rules, world_lore, characters,
+                                    template=template, seed_outline=seed)
         raw_content = _call_llm(model, prompt, ollama_client=ollama_client)
         outline = _parse_init_outline(raw_content, state.story_id)
+        if seed is not None:
+            outline = outline.model_copy(update={
+                field: getattr(seed, field)
+                for field in ("premise", "theme", "planned_ending")
+                if getattr(seed, field).strip()
+            })
         db.upsert_story_outline(outline, db_path)
         return {"story_outline": outline}
 
@@ -287,7 +321,7 @@ def _parse_revision(raw_content: str, story_id: str, chapter_number: int, prior_
 def maybe_revise_outline(
     state: ChapterGraphState,
     db_path: Optional[Path] = None,
-    model: str = MODEL,
+    model: Optional[str] = None,
     ollama_client=None,
     print_fn=print,
 ) -> Optional[StoryOutline]:

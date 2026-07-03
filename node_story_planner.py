@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from llm_client import MODEL, chat_json
+from llm_client import chat_json
 from schema import (
     CharacterRosterEntry, ContextPack, ChapterGraphState, StoryPlan,
 )
@@ -208,11 +208,9 @@ def build_planner_prompt(state: ChapterGraphState, template: Optional[str] = Non
         ),
         "continuation": (
             "CONTINUATION — advance the story naturally from where it left off. "
-            "Honor open plotlines and character arcs."
-        ),
-        "user_event_injection": (
-            "USER EVENT INJECTION — the user has specified a forced plot event (see directive). "
-            "Incorporate it coherently while still advancing the story."
+            "Honor open plotlines and character arcs. If the USER DIRECTIVE below "
+            "contains a specific instruction or plot event, treat it as mandatory "
+            "and incorporate it coherently while still advancing the story."
         ),
     }.get(state.input_mode or "", "UNKNOWN MODE")
 
@@ -246,7 +244,7 @@ def build_planner_prompt(state: ChapterGraphState, template: Optional[str] = Non
 # ---------------------------------------------------------------------------
 
 def make_story_planner_node(
-    model: str = MODEL,
+    model: Optional[str] = None,
     ollama_client=None,
     db_path=None,
 ) -> Callable[[ChapterGraphState], dict]:
