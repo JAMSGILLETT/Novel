@@ -8,6 +8,11 @@ json-repair>=0.25
 # Validated structured output — re-asks the model until the object matches the
 # Pydantic schema (used by node_combined_check via llm_client.chat_structured)
 instructor>=1.5
+# Required for instructor on Python < 3.10: its v2 code uses `str | Path` union
+# syntax that 3.9 can't evaluate without this backport. Without it,
+# instructor.from_openai raises TypeError and chat_structured falls back to the
+# tolerant JSON parser.
+eval_type_backport>=0.2; python_version < "3.10"
 
 # Data models / validation
 pydantic>=2.0

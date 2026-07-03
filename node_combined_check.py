@@ -66,7 +66,9 @@ Set canon_passed to false if any violations exist.
 Set craft_passed to false if any issues exist."""
 
 
-def build_combined_check_prompt(state: ChapterGraphState, template: Optional[str] = None) -> str:
+def build_combined_check_prompt(
+    state: ChapterGraphState, template: Optional[str] = None, include_demos: bool = True,
+) -> str:
     from prompt_templates import DEFAULT_TEMPLATES
 
     pack = state.context_pack
@@ -76,10 +78,17 @@ def build_combined_check_prompt(state: ChapterGraphState, template: Optional[str
 
     char_map = {c.id: c.name for c in pack.active_characters}
 
+    # DSPy-lite: attach relevance-selected few-shot demonstrations so the small
+    # local model sees worked examples of this exact judgment before making it.
+    demo_block = ""
+    if include_demos:
+        from check_demos import select_demos, format_demos
+        demo_block = format_demos(select_demos(pack))
+
     return f"""You are reviewing a novel chapter for two things simultaneously:
 1. CANON CONSISTENCY — does the prose violate world rules, character knowledge, or location constraints?
 2. CRAFT QUALITY — does the prose have genuine writing problems (pacing, tension, show-don't-tell, dialogue, voice)?
-
+{demo_block}
 === WORLD RULES (hard constraints) ===
 {_fmt_world_rules(pack)}
 
@@ -137,9 +146,14 @@ def make_combined_check_node(
                 client=ollama_client, label="Combined check",
             )
             return result.split()
-        except Exception:
+        except Exception as e:
             # Instructor exhausted its retries (or isn't available) — fall back
             # to the tolerant hand-rolled parser so a check is never skipped.
+            # Warn loudly: a *persistent* fallback (e.g. instructor failing to
+            # import) silently loses the validation guarantee, which is exactly
+            # the bug chat_structured was added to fix.
+            print(f"  [warn] Combined check: structured path failed, using JSON fallback: "
+                  f"{type(e).__name__}: {str(e)[:150]}")
             data = chat_json(
                 prompt, model=model, max_tokens=2048, client=ollama_client,
                 label="Combined check", response_format_fallback=True,
