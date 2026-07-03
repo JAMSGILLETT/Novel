@@ -107,15 +107,55 @@ DEMO_BANK: List[Demo] = [
 # Selection + formatting
 # ---------------------------------------------------------------------------
 
-def select_demos(pack: Optional[ContextPack], k: int = 3) -> List[Demo]:
+_MINED_PROSE_CHARS = 400  # cap a mined demo's prose so the prompt doesn't bloat
+
+
+def demo_from_verdict(v: dict) -> Optional[Demo]:
+    """Build a mined demo from a stored verdict dict (db.get_recent_check_verdicts).
+
+    We only trust CLEAN PASSES as mined demos: a passing chapter is a real,
+    in-voice example of prose that should NOT be flagged, which sharpens
+    calibration against this story's own style. We deliberately do NOT mine
+    flagged verdicts — those are the model's own unresolved judgments and may be
+    false positives, so reusing them as demos would reinforce mistakes. (Curated
+    violation examples stay in the seed bank; the Option-3 optimizer is where
+    mined violation demos would belong, filtered by a metric.)"""
+    if not v.get("passed"):
+        return None
+    prose = (v.get("prose") or "").strip()
+    if not prose:
+        return None
+    if len(prose) > _MINED_PROSE_CHARS:
+        prose = prose[:_MINED_PROSE_CHARS].rsplit(" ", 1)[0] + " …"
+    return Demo(
+        role="clean",
+        world_rules=v.get("world_rules") or "(no special rules)",
+        prose=prose,
+        verdict=CombinedCheckResult(canon_passed=True, violations=[],
+                                    craft_passed=True, issues=[]),
+    )
+
+
+def select_demos(
+    pack: Optional[ContextPack], k: int = 3, history: Optional[List[dict]] = None,
+) -> List[Demo]:
     """Pick up to k demos relevant to this chapter. Always includes one clean-pass
     demo (anti-over-flagging) and one craft demo; fills the rest with canon demos
-    whose rule category matches a world rule present in the chapter."""
+    whose rule category matches a world rule present in the chapter.
+
+    history: recent stored verdicts (db.get_recent_check_verdicts). When present,
+    a real clean-pass from this story is preferred over the seed clean-pass demo,
+    so calibration uses the story's own voice."""
     present: Set[str] = set()
     if pack is not None:
         present = {r.rule_type for r in pack.relevant_world_rules}
 
-    clean = next((d for d in DEMO_BANK if d.role == "clean"), None)
+    # Prefer a real clean pass mined from history; fall back to the seed demo.
+    mined_clean = next(
+        (d for d in (demo_from_verdict(v) for v in (history or [])) if d is not None),
+        None,
+    )
+    clean = mined_clean or next((d for d in DEMO_BANK if d.role == "clean"), None)
     craft = next((d for d in DEMO_BANK if d.role == "craft"), None)
 
     # Canon demos ranked: those matching a present rule category first.

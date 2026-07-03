@@ -444,6 +444,24 @@ def run_chapter(
                 p(f"    [{v.severity}] {v.description}")
         if not flagged:
             p(f"  Passed after {attempts} attempt(s)")
+
+        # Record the final verdict so the few-shot demo bank can grow from real
+        # history (check_demos mines this). Best-effort — never blocks a chapter.
+        try:
+            from schema import CombinedCheckResult
+            from node_combined_check import _fmt_world_rules
+            verdict = CombinedCheckResult(
+                canon_passed=canon_result.passed, violations=canon_result.violations,
+                craft_passed=craft_result.passed, issues=craft_result.issues,
+            )
+            db_module.save_check_verdict(
+                story_id, state.chapter_number, verdict.canon_passed and verdict.craft_passed,
+                _fmt_world_rules(state.context_pack), state.chapter_prose or "",
+                verdict.model_dump_json(), db_path,
+            )
+        except Exception as e:
+            p(f"  [warn] Couldn't record check verdict for demo history: {e}")
+
         p(f"  Done in {_elapsed(t0)}")
         _ckpt("canon", state)
         _ckpt("craft", state)

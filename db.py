@@ -193,6 +193,21 @@ def init_db(db_path: Optional[Path] = None) -> None:
             state_json TEXT NOT NULL,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )""",
+        # Every finished chapter's final canon+craft verdict, kept so the
+        # few-shot demo bank (check_demos) can grow from real history instead of
+        # only the curated seed examples. Stores the judged prose, the world
+        # rules it was judged against, and the verdict JSON.
+        """CREATE TABLE IF NOT EXISTS check_verdicts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            story_id TEXT NOT NULL,
+            chapter_number INTEGER NOT NULL,
+            passed INTEGER NOT NULL,
+            world_rules TEXT NOT NULL,
+            prose TEXT NOT NULL,
+            verdict_json TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(story_id, chapter_number)
+        )""",
         # story_id is the hot filter on nearly every read but isn't a PK on
         # these tables — index it so lookups stay O(log n) as a story grows.
         "CREATE INDEX IF NOT EXISTS idx_characters_story ON characters(story_id)",
@@ -591,6 +606,46 @@ def get_chapter_checkpoint(story_id: str, db_path: Optional[Path] = None, conn=N
 
 def delete_chapter_checkpoint(story_id: str, db_path: Optional[Path] = None, conn=None) -> None:
     _write("DELETE FROM chapter_checkpoints WHERE story_id = ?", (story_id,), db_path, conn)
+
+
+# ---------------------------------------------------------------------------
+# Check verdicts — real history the few-shot demo bank can grow from.
+# ---------------------------------------------------------------------------
+
+def save_check_verdict(
+    story_id: str, chapter_number: int, passed: bool, world_rules: str,
+    prose: str, verdict_json: str, db_path: Optional[Path] = None, conn=None,
+) -> None:
+    """Record a finished chapter's final verdict (idempotent per chapter)."""
+    _write(
+        """INSERT INTO check_verdicts
+               (story_id, chapter_number, passed, world_rules, prose, verdict_json)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(story_id, chapter_number) DO UPDATE SET
+               passed=excluded.passed, world_rules=excluded.world_rules,
+               prose=excluded.prose, verdict_json=excluded.verdict_json""",
+        (story_id, chapter_number, 1 if passed else 0, world_rules, prose, verdict_json),
+        db_path, conn,
+    )
+
+
+def get_recent_check_verdicts(
+    story_id: str, limit: int = 20, db_path: Optional[Path] = None, conn=None,
+) -> List[dict]:
+    """Most recent verdicts for a story, newest first: each a dict with
+    chapter_number, passed(bool), world_rules, prose, verdict_json."""
+    rows = _fetch_all(
+        """SELECT chapter_number, passed, world_rules, prose, verdict_json
+             FROM check_verdicts WHERE story_id = ?
+            ORDER BY chapter_number DESC LIMIT ?""",
+        (story_id, limit), db_path, conn,
+    )
+    return [
+        {"chapter_number": r["chapter_number"], "passed": bool(r["passed"]),
+         "world_rules": r["world_rules"], "prose": r["prose"],
+         "verdict_json": r["verdict_json"]}
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

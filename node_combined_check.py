@@ -68,6 +68,7 @@ Set craft_passed to false if any issues exist."""
 
 def build_combined_check_prompt(
     state: ChapterGraphState, template: Optional[str] = None, include_demos: bool = True,
+    history: Optional[list] = None,
 ) -> str:
     from prompt_templates import DEFAULT_TEMPLATES
 
@@ -83,7 +84,7 @@ def build_combined_check_prompt(
     demo_block = ""
     if include_demos:
         from check_demos import select_demos, format_demos
-        demo_block = format_demos(select_demos(pack))
+        demo_block = format_demos(select_demos(pack, history=history))
 
     return f"""You are reviewing a novel chapter for two things simultaneously:
 1. CANON CONSISTENCY — does the prose violate world rules, character knowledge, or location constraints?
@@ -138,8 +139,21 @@ def make_combined_check_node(
     db_path=None,
 ) -> Callable[[ChapterGraphState], tuple[CanonCheckResult, CraftCheckResult]]:
 
+    # Mined clean-pass history is stable across a chapter's many check calls
+    # (best-of-N × attempts), so fetch it once per node build.
+    _history_cache: dict = {}
+
+    def _history(story_id: str) -> list:
+        if "h" not in _history_cache:
+            try:
+                import db
+                _history_cache["h"] = db.get_recent_check_verdicts(story_id, limit=20, db_path=db_path)
+            except Exception:
+                _history_cache["h"] = []
+        return _history_cache["h"]
+
     def check(state: ChapterGraphState) -> tuple[CanonCheckResult, CraftCheckResult]:
-        prompt = build_combined_check_prompt(state)
+        prompt = build_combined_check_prompt(state, history=_history(state.story_id))
         try:
             result = chat_structured(
                 prompt, CombinedCheckResult, model=model, max_tokens=2048,
