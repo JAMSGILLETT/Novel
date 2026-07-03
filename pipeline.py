@@ -61,62 +61,6 @@ def _backup_database(db_path: Path, chapter_number: int, print_fn=print) -> None
         print_fn(f"  [warn] Database backup failed (continuing anyway): {e}")
 
 
-def _run_revision_loop(
-    state: ChapterGraphState,
-    check_fn: Callable[[ChapterGraphState], object],
-    writer_node: Callable[..., dict],
-    max_retries: int,
-    label: str,
-    print_fn=print,
-    first_result=None,
-):
-    """Runs check_fn(state) repeatedly, asking writer_node to revise the prose
-    on failure, up to max_retries times. Works for both CanonCheckResult
-    (.violations) and CraftCheckResult (.issues) — pipeline.py owns this loop
-    for both checks so neither check node has to privately couple itself to
-    the writer.
-
-    first_result: a pre-computed check result for attempt 1 (used when the first
-    pass was already run concurrently upstream, so it isn't re-run here). Only
-    valid when it was computed against the current prose.
-
-    Returns (state_with_revised_prose, result, attempts, flagged: bool).
-    """
-    p = print_fn
-    attempts = 0
-    current_state = state
-
-    while True:
-        attempts += 1
-        p(f"  {label} check attempt {attempts}/{max_retries + 1}...")
-        if attempts == 1 and first_result is not None:
-            result = first_result
-        else:
-            result = check_fn(current_state)
-        problems = list(getattr(result, "violations", None) or []) + list(getattr(result, "issues", []))
-
-        if result.passed:
-            p(f"  {label} check PASSED")
-            return current_state, result, attempts, False
-
-        p(f"  {label} check FAILED — {len(problems)} issue(s):")
-        descriptions = []
-        for v in problems:
-            kind = getattr(v, "violation_type", None) or getattr(v, "issue_type", "?")
-            severity = getattr(v, "severity", "?")
-            desc = getattr(v, "description", "")
-            p(f"    [{severity}] {kind}: {desc}")
-            descriptions.append(f"[{severity}] {kind}: {desc}")
-
-        if attempts > max_retries:
-            p(f"  Retry cap reached ({max_retries} retries) — flagging for review and publishing as-is")
-            return current_state, result, attempts, True
-
-        p(f"  Requesting revision from writer (attempt {attempts + 1})...")
-        writer_result = writer_node(current_state, violation_feedback=descriptions)
-        current_state = current_state.model_copy(update={"chapter_prose": writer_result["chapter_prose"]})
-
-
 def _save_chapter(state: ChapterGraphState, manuscripts_dir: Path, book_title: str) -> Path:
     """Save chapter to manuscripts/{book_title}/Chapter {n}.txt. Returns the file path."""
     book_dir = manuscripts_dir / book_title
@@ -463,29 +407,19 @@ def run_chapter(
     # check re-runs on the new prose. Both "canon" and "craft" stage keys map
     # to this one block so resume-from-checkpoint still works.
     from node_combined_check import make_combined_check_node
+    from node_reviser import make_reviser_loop
 
+    # Evaluator: grounded combined check. Actor: best-of-N local-edit reviser
+    # with memory across attempts (node_reviser). The reviser re-scores each
+    # candidate with this same evaluator, so canon stays grounded throughout.
     combined_check = make_combined_check_node(db_path=db_path)
-
-    def _combined_check_wrapper(s):
-        """Wraps combined check so _run_revision_loop sees a unified .passed."""
-        canon_r, craft_r = combined_check(s)
-        # Attach both result sets to a simple namespace for the loop
-        class _R:
-            passed = canon_r.passed and craft_r.passed
-            violations = list(canon_r.violations)
-            issues = list(craft_r.issues)
-            canon = canon_r
-            craft = craft_r
-        return _R()
+    reviser_loop = make_reviser_loop(combined_check, print_fn=p)
 
     if _run("canon") or _run("craft"):
         stage(f"NODE 6 — CANON + CRAFT CHECK  [{_MODEL}]")
         t0 = time.time()
         max_retries = max(MAX_CANON_CHECK_RETRIES, MAX_CRAFT_CHECK_RETRIES)
-        state, combined_result, attempts, flagged = _run_revision_loop(
-            state, _combined_check_wrapper, writer_node, max_retries, "Canon+Craft",
-            print_fn=p,
-        )
+        state, combined_result, attempts, flagged = reviser_loop(state, max_retries)
         canon_result  = combined_result.canon
         craft_result  = combined_result.craft
         canon_flagged = not canon_result.passed and flagged

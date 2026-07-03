@@ -80,6 +80,7 @@ def chat(
     response_format: Optional[dict] = None,
     tools: Optional[list] = None,
     tool_choice: Optional[dict] = None,
+    temperature: Optional[float] = None,
     client: Optional[Any] = None,
     retries: int = 3,
     label: str = "Ollama",
@@ -106,6 +107,8 @@ def chat(
     }
     if response_format is not None:
         kwargs["response_format"] = response_format
+    if temperature is not None:
+        kwargs["temperature"] = temperature
     if tools is not None:
         kwargs["tools"] = tools
     if tool_choice is not None:
