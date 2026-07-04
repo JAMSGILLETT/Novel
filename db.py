@@ -343,6 +343,11 @@ def get_canon_rules_triggered_by(
     return [CanonRule(**dict(r)) for r in rows]
 
 
+def get_all_canon_rules(story_id: str, db_path: Optional[Path] = None, conn=None) -> List[CanonRule]:
+    rows = _fetch_all("SELECT * FROM canon_rules WHERE story_id = ?", (story_id,), db_path, conn)
+    return [CanonRule(**dict(r)) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # Write helpers (used by tests and node 10)
 #
@@ -536,6 +541,56 @@ def list_stories(db_path: Optional[Path] = None, conn=None) -> List[dict]:
     return [{"story_id": r["story_id"], "book_title": r["book_title"]} for r in rows]
 
 
+def rename_story(story_id: str, new_title: str, db_path: Optional[Path] = None, conn=None) -> None:
+    """Change a story's display title. (The manuscripts folder — named by title —
+    is moved separately by the GUI, since db.py doesn't own the filesystem.)"""
+    _write("INSERT OR REPLACE INTO stories (story_id, book_title) VALUES (?, ?)",
+           (story_id, new_title), db_path, conn)
+
+
+# Every table that carries a story_id, so deleting a story leaves nothing behind.
+# (world_rules / world_lore / app_settings are global and intentionally excluded.)
+_STORY_SCOPED_TABLES = [
+    "chapters", "characters", "plotlines", "locations", "pov_state",
+    "chapter_summaries", "world_entities", "story_metadata", "canon_rules",
+    "story_outline", "act_summaries", "prompt_overrides", "chapter_checkpoints",
+    "check_verdicts", "stories",
+]
+
+
+def delete_story(story_id: str, db_path: Optional[Path] = None) -> None:
+    """Remove a story and all of its per-story rows in one transaction. Tables
+    that don't exist yet are skipped, so this is safe on partially-migrated DBs.
+    (Chroma vectors and the manuscripts folder are handled by the caller.)"""
+    conn = get_connection(db_path)
+    try:
+        existing = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        for table in _STORY_SCOPED_TABLES:
+            if table in existing:
+                conn.execute(f"DELETE FROM {table} WHERE story_id = ?", (story_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_chapter(story_id: str, chapter_number: int, db_path: Optional[Path] = None) -> None:
+    """Remove a chapter's DB records (chapters row + its summary). The manuscript
+    file is deleted by the caller. Note: world-state changes the chapter wrote in
+    earlier nodes are NOT reversed — deleting the latest chapter is clean (its
+    number frees up for a re-run); deleting a middle chapter leaves a gap."""
+    conn = get_connection(db_path)
+    try:
+        conn.execute("DELETE FROM chapters WHERE story_id = ? AND chapter_number = ?",
+                     (story_id, chapter_number))
+        conn.execute("DELETE FROM chapter_summaries WHERE story_id = ? AND chapter_number = ?",
+                     (story_id, chapter_number))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # App settings (global key/value, e.g. the selected generation model)
 # ---------------------------------------------------------------------------
@@ -666,8 +721,14 @@ def _pretty_tag(tag: str) -> str:
     return tag.replace("prerestore", "Pre-restore").capitalize()
 
 
+def _chroma_sibling(db_backup_path: Path) -> Path:
+    """The Chroma snapshot (.chroma.zip) that pairs with a given .db backup."""
+    return db_backup_path.parent / (db_backup_path.stem + ".chroma.zip")
+
+
 def list_backups(db_path: Optional[Path] = None) -> List[dict]:
-    """Snapshots for this DB, newest first: {path, tag, label, when, size_kb}."""
+    """Snapshots for this DB, newest first:
+    {path, tag, label, when, size_kb, has_chroma}."""
     base = db_path if db_path is not None else DB_PATH
     d = _backups_dir(base)
     if not d.exists():
@@ -677,12 +738,17 @@ def list_backups(db_path: Optional[Path] = None) -> List[dict]:
         rest = p.stem[len(base.stem) + 1:]        # strip "<stem>_"
         tag = rest.split("_", 1)[0]               # "ch3" / "manual" / "prerestore"
         st = p.stat()
+        chroma_zip = _chroma_sibling(p)
+        size_kb = st.st_size // 1024
+        if chroma_zip.exists():
+            size_kb += chroma_zip.stat().st_size // 1024
         out.append({
             "path": p,
             "tag": tag,
             "label": _pretty_tag(tag),
             "when": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M"),
-            "size_kb": max(1, st.st_size // 1024),
+            "size_kb": max(1, size_kb),
+            "has_chroma": chroma_zip.exists(),
             "mtime": st.st_mtime,
         })
     out.sort(key=lambda b: b["mtime"], reverse=True)
@@ -692,15 +758,18 @@ def list_backups(db_path: Optional[Path] = None) -> List[dict]:
 def _prune_backups(base: Path) -> None:
     existing = sorted(_backups_dir(base).glob(f"{base.stem}_*.db"), key=lambda p: p.stat().st_mtime)
     for stale in existing[:-BACKUP_RETENTION]:
-        try:
-            stale.unlink()
-        except OSError:
-            pass
+        for f in (stale, _chroma_sibling(stale)):  # drop the paired chroma zip too
+            try:
+                f.unlink()
+            except OSError:
+                pass
 
 
-def create_backup(db_path: Optional[Path] = None, tag: str = "manual") -> Optional[Path]:
+def create_backup(db_path: Optional[Path] = None, tag: str = "manual", chroma_path=None) -> Optional[Path]:
     """Checkpoint the WAL (so the copy has every committed change) and snapshot
-    the DB into backups/, pruning to BACKUP_RETENTION. Returns the new path."""
+    the DB into backups/, pruning to BACKUP_RETENTION. If chroma_path is given,
+    also snapshot the vector store as a sibling .chroma.zip so a restore keeps
+    the DB and its embeddings in sync. Returns the new .db path."""
     base = db_path if db_path is not None else DB_PATH
     if not base.exists():
         return None
@@ -715,20 +784,29 @@ def create_backup(db_path: Optional[Path] = None, tag: str = "manual") -> Option
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dest = d / f"{base.stem}_{tag}_{stamp}.db"
     shutil.copy2(base, dest)
+    # Pair the DB snapshot with the vector store. Best-effort: a lock during
+    # live generation only means this one snapshot is DB-only.
+    if chroma_path is not None:
+        cpath = Path(chroma_path)
+        if cpath.exists() and any(cpath.iterdir()):
+            try:
+                shutil.make_archive(str(dest.with_suffix("")) + ".chroma", "zip", root_dir=str(cpath))
+            except Exception:
+                pass
     _prune_backups(base)
     return dest
 
 
-def restore_backup(backup_path, db_path: Optional[Path] = None) -> None:
-    """Overwrite the live DB with a snapshot. Saves the current DB first (as a
-    'prerestore' snapshot) and clears WAL sidecars so SQLite can't replay stale
-    frames onto the restored file."""
+def restore_backup(backup_path, db_path: Optional[Path] = None, chroma_path=None) -> None:
+    """Overwrite the live DB — and, if the snapshot captured one, the vector
+    store — with a backup. Saves the current DB+Chroma first as a 'prerestore'
+    snapshot, and clears WAL sidecars so SQLite can't replay stale frames."""
     base = db_path if db_path is not None else DB_PATH
     backup_path = Path(backup_path)
     if not backup_path.exists():
         raise FileNotFoundError(backup_path)
     if base.exists():
-        create_backup(base, tag="prerestore")
+        create_backup(base, tag="prerestore", chroma_path=chroma_path)
     for suffix in ("-wal", "-shm"):
         side = base.parent / (base.name + suffix)
         if side.exists():
@@ -737,6 +815,16 @@ def restore_backup(backup_path, db_path: Optional[Path] = None) -> None:
             except OSError:
                 pass
     shutil.copy2(backup_path, base)
+    # Restore the paired vector store if this snapshot captured one; otherwise
+    # leave the current store untouched (older, DB-only backups).
+    if chroma_path is not None:
+        chroma_zip = _chroma_sibling(backup_path)
+        if chroma_zip.exists():
+            cpath = Path(chroma_path)
+            if cpath.exists():
+                shutil.rmtree(cpath, ignore_errors=True)
+            cpath.mkdir(parents=True, exist_ok=True)
+            shutil.unpack_archive(str(chroma_zip), str(cpath))
 
 
 if __name__ == "__main__":

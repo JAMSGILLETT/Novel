@@ -37,7 +37,7 @@ FIELD_SPECS: dict[str, list] = {
         ("knowledge",           "Knowledge  (one per line)",         "list",   False),
         ("secrets",             "Secrets  (one per line)",           "list",   False),
         ("relationships",       "Relationships  (Name: description, one per line)", "dict", False),
-        ("current_location_id", "Current Location ID",               "entry",  False),
+        ("current_location_id", "Current Location",                  "ref",    False, "location"),
     ],
     "Location": [
         ("name",              "Name",                             "entry",  True),
@@ -55,7 +55,7 @@ FIELD_SPECS: dict[str, list] = {
         ("progress_stage", "Progress Stage",                             "text",   True),
         ("current_tension","Tension  (0 – 10)",                         "int",    True),
         ("next_possible_developments", "Next Possible Developments  (one per line)", "list", False),
-        ("involved_character_ids",     "Involved Character IDs  (one per line)",     "list", False),
+        ("involved_character_ids",     "Involved Characters",                        "ref_list", False, "character"),
     ],
     "World Rule": [
         ("rule_type", "Rule Type", "option", True,
@@ -70,10 +70,10 @@ FIELD_SPECS: dict[str, list] = {
         ("content", "Content", "text",  True),
     ],
     "POV State": [
-        ("location_id",      "Location ID  (required)",          "entry",  True),
-        ("pov_character_id", "POV Character ID",                 "entry",  False),
+        ("location_id",      "Location  (required)",             "ref",    True,  "location"),
+        ("pov_character_id", "POV Character",                    "ref",    False, "character"),
         ("emotional_state",  "Emotional State",                  "entry",  False),
-        ("companions",       "Companion IDs  (one per line)",    "list",   False),
+        ("companions",       "Companions",                       "ref_list", False, "character"),
         ("inventory",        "Inventory  (one per line)",        "list",   False),
         ("injuries",         "Injuries  (one per line)",         "list",   False),
         ("goals",            "Goals  (one per line)",            "list",   False),
@@ -85,6 +85,14 @@ FIELD_SPECS: dict[str, list] = {
         ("premise",        "Premise  (1–2 sentence core idea the story planner steers by)", "text", False),
         ("theme",          "Theme  (thematic throughline)",                                 "text", False),
         ("planned_ending", "Planned Ending  (rough direction — it will evolve)",           "text", False),
+    ],
+    # Dependency-graph rule: whenever the trigger entity is pulled into a chapter's
+    # context, the inject entity is force-included too (bypassing relevance), with
+    # the reason shown to the planner/writer as mandatory context.
+    "Canon Rule": [
+        ("trigger", "When this entity appears in a chapter…", "entity_any", True),
+        ("inject",  "…always pull in this entity",            "entity_any", True),
+        ("reason",  "Reason  (why they're linked — shown to the writer)", "text", True),
     ],
     # ── WorldEntity-backed types (category + name + description + attributes) ──
     "Organization": [
@@ -176,6 +184,12 @@ FIELD_SPECS: dict[str, list] = {
         ("_attr_consequences",  "Consequences  (one per line)",       "list",  False),
         ("_attr_related_plots", "Related Plotlines  (one per line)",  "list",  False),
     ],
+}
+
+# Entity types a canon rule can reference (and their display labels).
+_TYPE_LABEL = {
+    "character": "Character", "location": "Location", "plotline": "Plotline",
+    "world_rule": "World Rule", "world_lore": "World Lore",
 }
 
 # Entity types that map to WorldEntity in the DB
@@ -333,9 +347,20 @@ class WorldBibleTab:
         self._list_frame.configure(label_text=entity_type + "s")
 
         entities = self._load_all(entity_type)
+        name_map = (
+            {(t, i): n for t, i, n in self._all_ref_entities()}
+            if entity_type == "Canon Rule" else None
+        )
         for entity in entities:
-            label = getattr(entity, "name", None) or getattr(entity, "title", None) \
-                    or ("Story Outline" if entity_type == "Story Outline" else f"{entity_type} (no name)")
+            if entity_type == "Canon Rule":
+                trig = name_map.get((entity.trigger_entity_type, entity.trigger_entity_id),
+                                    entity.trigger_entity_id[:8])
+                inj = name_map.get((entity.inject_entity_type, entity.inject_entity_id),
+                                   entity.inject_entity_id[:8])
+                label = f"{trig}  ▸  {inj}"
+            else:
+                label = getattr(entity, "name", None) or getattr(entity, "title", None) \
+                        or ("Story Outline" if entity_type == "Story Outline" else f"{entity_type} (no name)")
             btn = ctk.CTkButton(
                 self._list_frame,
                 text=label,
@@ -349,6 +374,41 @@ class WorldBibleTab:
             self._entity_buttons.append(btn)
 
     # ── Form ──────────────────────────────────────────────────────────────
+
+    def _ref_candidates(self, ref_type: str) -> list[tuple[str, str]]:
+        """(id, name) pairs for a referenced entity type, sorted by name, so
+        linking fields offer a by-name picker instead of raw UUID entry."""
+        import db
+        try:
+            if ref_type == "character":
+                items = [(c.id, c.name) for c in db.get_all_characters(self.story_id, self.db_path)]
+            elif ref_type == "location":
+                items = [(l.id, l.name) for l in db.get_all_locations(self.story_id, self.db_path)]
+            elif ref_type == "plotline":
+                items = [(p.id, p.name) for p in db.get_all_plotlines(self.story_id, self.db_path)]
+            else:
+                items = []
+        except Exception:
+            items = []
+        return sorted(items, key=lambda t: (t[1] or "").lower())
+
+    @staticmethod
+    def _ref_label(name: str, entity_id: str) -> str:
+        return f"{name or '(unnamed)'}  ·  {entity_id[:8]}"
+
+    def _all_ref_entities(self) -> list[tuple[str, str, str]]:
+        """(type, id, name) across every entity type a canon rule can reference."""
+        import db
+        out: list[tuple[str, str, str]] = []
+        try:
+            out += [("character", c.id, c.name) for c in db.get_all_characters(self.story_id, self.db_path)]
+            out += [("location", l.id, l.name) for l in db.get_all_locations(self.story_id, self.db_path)]
+            out += [("plotline", p.id, p.name) for p in db.get_all_plotlines(self.story_id, self.db_path)]
+            out += [("world_rule", r.id, r.title) for r in db.get_all_world_rules(self.db_path)]
+            out += [("world_lore", w.id, w.title) for w in db.get_all_world_lore(self.db_path)]
+        except Exception:
+            pass
+        return out
 
     def _rebuild_form(self, entity_type: str, entity=None):
         for widget in self._form_frame.winfo_children():
@@ -387,6 +447,10 @@ class WorldBibleTab:
                 current_val = entity.attributes.get(attr_key)
             elif field_name.startswith("_attr_"):
                 current_val = None
+            elif wtype == "entity_any" and entity is not None:
+                # Canon-rule references live as (type, id) pairs on the model.
+                current_val = (getattr(entity, f"{field_name}_entity_type", ""),
+                               getattr(entity, f"{field_name}_entity_id", ""))
             else:
                 current_val = getattr(entity, field_name, None) if entity else None
 
@@ -431,6 +495,79 @@ class WorldBibleTab:
                 if current_val is not None:
                     w.insert(0, str(current_val))
 
+            elif wtype == "ref":
+                # Single entity reference: pick by name, store the id. `choices`
+                # holds the referenced entity type (e.g. "location").
+                candidates = self._ref_candidates(choices)
+                label_to_id = {"(none)": ""}
+                values = ["(none)"]
+                cur_id = str(current_val) if current_val else ""
+                cur_label = "(none)"
+                for cid, name in candidates:
+                    lab = self._ref_label(name, cid)
+                    label_to_id[lab] = cid
+                    values.append(lab)
+                    if cid == cur_id:
+                        cur_label = lab
+                # Keep a stale/unknown current id visible instead of silently dropping it
+                if cur_id and cur_id not in label_to_id.values():
+                    lab = self._ref_label("(unknown)", cur_id)
+                    label_to_id[lab] = cur_id
+                    values.append(lab)
+                    cur_label = lab
+                var = ctk.StringVar(value=cur_label)
+                w = ctk.CTkOptionMenu(self._form_frame, values=values, variable=var, font=("", 12))
+                w.grid(row=row, column=0, sticky="ew", pady=(0, 2))
+                w._var = var
+                w._label_to_id = label_to_id
+
+            elif wtype == "ref_list":
+                # Multi reference: a checkbox per candidate; stores a list of ids.
+                candidates = self._ref_candidates(choices)
+                cur_ids = {str(x) for x in (current_val or [])}
+                box = ctk.CTkFrame(self._form_frame, fg_color=("gray90", "gray17"))
+                box.grid(row=row, column=0, sticky="ew", pady=(0, 2))
+                checks: list[tuple[str, ctk.BooleanVar]] = []
+                known = {cid for cid, _ in candidates}
+                if not candidates and not cur_ids:
+                    ctk.CTkLabel(box, text="(no characters to link yet)",
+                                 text_color="gray60", font=("", 11)).pack(anchor="w", padx=6, pady=4)
+                for cid, name in candidates:
+                    bvar = ctk.BooleanVar(value=cid in cur_ids)
+                    ctk.CTkCheckBox(box, text=self._ref_label(name, cid), variable=bvar,
+                                    font=("", 11), checkbox_width=16, checkbox_height=16).pack(anchor="w", padx=6, pady=1)
+                    checks.append((cid, bvar))
+                for sid in cur_ids - known:  # stale ids kept and pre-checked
+                    bvar = ctk.BooleanVar(value=True)
+                    ctk.CTkCheckBox(box, text=self._ref_label("(unknown)", sid), variable=bvar,
+                                    font=("", 11), checkbox_width=16, checkbox_height=16).pack(anchor="w", padx=6, pady=1)
+                    checks.append((sid, bvar))
+                w = box
+                w._checks = checks
+
+            elif wtype == "entity_any":
+                # Pick any entity across all canon-referenceable types; stores (type, id).
+                label_to_ref = {"(none)": None}
+                values = ["(none)"]
+                cur = current_val if (current_val and current_val[1]) else None
+                cur_label = "(none)"
+                for etype, eid, name in self._all_ref_entities():
+                    lab = f"[{_TYPE_LABEL.get(etype, etype)}] {name or '(unnamed)'}  ·  {eid[:8]}"
+                    label_to_ref[lab] = (etype, eid)
+                    values.append(lab)
+                    if cur and etype == cur[0] and eid == cur[1]:
+                        cur_label = lab
+                if cur and cur_label == "(none)":  # stale reference — keep it visible
+                    lab = f"[{_TYPE_LABEL.get(cur[0], cur[0])}] (unknown)  ·  {cur[1][:8]}"
+                    label_to_ref[lab] = cur
+                    values.append(lab)
+                    cur_label = lab
+                var = ctk.StringVar(value=cur_label)
+                w = ctk.CTkOptionMenu(self._form_frame, values=values, variable=var, font=("", 12))
+                w.grid(row=row, column=0, sticky="ew", pady=(0, 2))
+                w._var = var
+                w._label_to_ref = label_to_ref
+
             self._field_widgets[field_name] = (wtype, w, required, choices)
             row += 1
 
@@ -471,6 +608,12 @@ class WorldBibleTab:
                 val = _read_dict(widget)
             elif wtype == "text":
                 val = widget.get("1.0", "end").strip()
+            elif wtype == "ref":
+                val = widget._label_to_id.get(widget._var.get(), "") or None
+            elif wtype == "ref_list":
+                val = [cid for cid, bvar in widget._checks if bvar.get()]
+            elif wtype == "entity_any":
+                val = widget._label_to_ref.get(widget._var.get())  # (type, id) or None
             else:
                 val = None
 
@@ -497,6 +640,17 @@ class WorldBibleTab:
         except Exception as e:
             self._error_label.configure(text=f"Save failed: {e}", text_color="#f5a623")
 
+    def _write_kwargs(self, data: dict) -> dict:
+        """Upsert kwargs: drop blank scalar/list fields (so the form never wipes
+        a field it didn't touch), but KEEP reference fields even when empty —
+        that's what lets choosing '(none)' or unchecking all actually unlink."""
+        ref_fields = {f for f, (wt, *_rest) in self._field_widgets.items() if wt in ("ref", "ref_list")}
+        out: dict = {}
+        for k, v in data.items():
+            if k in ref_fields or v not in (None, "", [], {}):
+                out[k] = v
+        return out
+
     def _write_entity(self, entity_type: str, data: dict):
         import db
         import vector_store as vs
@@ -512,7 +666,7 @@ class WorldBibleTab:
         if entity_type == "Character":
             from schema import Character
             existing = self._current_entity
-            kwargs = {k: v for k, v in data.items() if v not in (None, "", [], {})}
+            kwargs = self._write_kwargs(data)
             if existing:
                 obj = existing.model_copy(update=kwargs)
             else:
@@ -523,7 +677,7 @@ class WorldBibleTab:
         elif entity_type == "Location":
             from schema import Location
             existing = self._current_entity
-            kwargs = {k: v for k, v in data.items() if v not in (None, "", [], {})}
+            kwargs = self._write_kwargs(data)
             if existing:
                 obj = existing.model_copy(update=kwargs)
             else:
@@ -537,7 +691,7 @@ class WorldBibleTab:
             tension = data.get("current_tension")
             if tension is not None:
                 data["current_tension"] = max(0, min(10, int(tension)))
-            kwargs = {k: v for k, v in data.items() if v not in (None, "", [], {})}
+            kwargs = self._write_kwargs(data)
             if existing:
                 obj = existing.model_copy(update=kwargs)
             else:
@@ -548,7 +702,7 @@ class WorldBibleTab:
         elif entity_type == "World Rule":
             from schema import WorldRule
             existing = self._current_entity
-            kwargs = {k: v for k, v in data.items() if v not in (None, "", [], {})}
+            kwargs = self._write_kwargs(data)
             if existing:
                 obj = existing.model_copy(update=kwargs)
             else:
@@ -559,7 +713,7 @@ class WorldBibleTab:
         elif entity_type == "World Lore":
             from schema import WorldLore
             existing = self._current_entity
-            kwargs = {k: v for k, v in data.items() if v not in (None, "", [], {})}
+            kwargs = self._write_kwargs(data)
             if existing:
                 obj = existing.model_copy(update=kwargs)
             else:
@@ -570,7 +724,7 @@ class WorldBibleTab:
         elif entity_type == "POV State":
             from schema import POVState
             existing = self._current_entity
-            kwargs = {k: v for k, v in data.items() if v not in (None, "", [], {})}
+            kwargs = self._write_kwargs(data)
             if existing:
                 obj = existing.model_copy(update=kwargs)
             else:
@@ -594,6 +748,24 @@ class WorldBibleTab:
             else:
                 obj = StoryOutline(story_id=self.story_id, **updates)
             db.upsert_story_outline(obj, self.db_path)
+
+        elif entity_type == "Canon Rule":
+            import uuid
+            from schema import CanonRule
+            trigger, inject = data.get("trigger"), data.get("inject")
+            if not trigger or not inject:
+                raise ValueError("pick both a trigger and an inject entity")
+            tt, tid = trigger
+            it, iid = inject
+            existing = self._current_entity
+            rule_id = existing.rule_id if existing else f"rule-{uuid.uuid4().hex[:12]}"
+            obj = CanonRule(
+                rule_id=rule_id, story_id=self.story_id,
+                trigger_entity_type=tt, trigger_entity_id=tid,
+                inject_entity_type=it, inject_entity_id=iid,
+                reason=data.get("reason") or "",
+            )
+            db.insert_canon_rule(obj, self.db_path)
 
         elif entity_type in _WORLD_ENTITY_TYPES:
             from schema import WorldEntity
@@ -669,6 +841,9 @@ class WorldBibleTab:
                              (eid, self.story_id))
             else:
                 conn.execute(f"DELETE FROM {table} WHERE id = ?", (eid,))
+        elif entity_type == "Canon Rule":
+            conn.execute("DELETE FROM canon_rules WHERE rule_id = ? AND story_id = ?",
+                         (entity.rule_id, self.story_id))
         elif entity_type in _WORLD_ENTITY_TYPES:
             conn.execute("DELETE FROM world_entities WHERE id = ? AND story_id = ?",
                          (entity.id, self.story_id))
@@ -697,6 +872,8 @@ class WorldBibleTab:
             elif entity_type == "Story Outline":
                 outline = db.get_story_outline(self.story_id, self.db_path)
                 return [outline] if outline else []
+            elif entity_type == "Canon Rule":
+                return db.get_all_canon_rules(self.story_id, self.db_path)
             elif entity_type in _WORLD_ENTITY_TYPES:
                 return db.get_world_entities_by_category(entity_type, self.story_id, self.db_path)
         except Exception:

@@ -59,6 +59,19 @@ KEEP_ALIVE = os.environ.get("NOVELGEN_KEEP_ALIVE", "30m")
 
 _shared_client = None
 
+# Optional live-token sink for "typewriter" output. When the GUI registers one,
+# prose calls made with stream=True emit each token to it as it arrives; when it
+# is None (default), those calls behave exactly like normal blocking calls.
+_stream_sink: Optional[Any] = None
+
+
+def set_stream_sink(sink: Optional[Any]) -> None:
+    """Register (or clear, with None) where streamed tokens go. The sink is a
+    callable taking one string; it must be cheap and thread-safe (the GUI's
+    just enqueues onto its output queue)."""
+    global _stream_sink
+    _stream_sink = sink
+
 
 def get_client(client: Optional[Any] = None):
     """Return the injected client (tests) or a lazily-built shared singleton."""
@@ -179,10 +192,61 @@ def chat_structured(
     )
 
 
-def chat_text(prompt: Union[str, List[dict]], **kwargs) -> str:
-    """chat() convenience for plain-text prose responses (writer, summaries)."""
+def chat_text(prompt: Union[str, List[dict]], *, stream: bool = False, **kwargs) -> str:
+    """chat() convenience for plain-text prose responses (writer, summaries).
+
+    Pass stream=True on prose calls you'd like shown token-by-token. It only
+    actually streams when a sink is registered (set_stream_sink); otherwise it
+    falls back to a normal blocking call. Returns the full accumulated text
+    either way, so callers are unaffected.
+    """
+    if stream and _stream_sink is not None:
+        return _chat_text_streaming(prompt, sink=_stream_sink, **kwargs)
     response = chat(prompt, **kwargs)
     return (response.choices[0].message.content or "").strip()
+
+
+def _chat_text_streaming(
+    prompt: Union[str, List[dict]], *, sink, model: Optional[str] = None,
+    max_tokens: int = 2048, timeout: int = 600, temperature: Optional[float] = None,
+    client: Optional[Any] = None, retries: int = 3, label: str = "Ollama", print_fn=print,
+) -> str:
+    """Blocking call with stream=True: forward each token to `sink` as it lands
+    and return the full accumulated text. Same retry/keep-alive shape as chat()."""
+    c = get_client(client)
+    model = model or get_model()
+    messages = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else prompt
+    kwargs: dict = {
+        "model": model, "max_tokens": max_tokens, "timeout": timeout,
+        "messages": messages, "extra_body": {"keep_alive": KEEP_ALIVE}, "stream": True,
+    }
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+
+    for attempt in range(retries):
+        try:
+            parts: List[str] = []
+            for chunk in c.chat.completions.create(**kwargs):
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content or ""
+                if delta:
+                    parts.append(delta)
+                    try:
+                        sink(delta)
+                    except Exception:
+                        pass  # never let a display hiccup break generation
+            return "".join(parts).strip()
+        except Exception as e:
+            if attempt == retries - 1:
+                raise
+            wait = 2 ** attempt * 3
+            print_fn(f"  {label} error — retrying in {wait}s (attempt {attempt + 1}/{retries}): {e}")
+            try:
+                sink("\n  [stream interrupted — retrying]\n")
+            except Exception:
+                pass
+            time.sleep(wait)
 
 
 def chat_json(

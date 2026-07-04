@@ -272,7 +272,7 @@ def make_story_writer_node(
         prose = chat_text(
             prompt, model=model, max_tokens=4096,
             timeout=900,  # 15 min — 70B writing 1200 words takes a while
-            client=ollama_client, label="Story writer",
+            client=ollama_client, label="Story writer", stream=True,
         )
 
         target = state.story_plan.target_word_count if state.story_plan else 1000
@@ -288,7 +288,7 @@ def make_story_writer_node(
             try:
                 continuation = chat_text(
                     continuation_prompt, model=model, max_tokens=2048, timeout=900,
-                    client=ollama_client, retries=1, label="Story writer (continuation)",
+                    client=ollama_client, retries=1, label="Story writer (continuation)", stream=True,
                 )
                 if continuation:
                     prose = prose + "\n\n" + continuation

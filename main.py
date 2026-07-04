@@ -88,6 +88,10 @@ class NovelGenApp(ctk.CTk):
         self._stage_step = 0
         self._stage_total = 0
 
+        # Typewriter (live token streaming) — off by default.
+        self._typewriter = db.get_setting("typewriter", "0", DB_PATH) == "1"
+        self._apply_typewriter()
+
         self._build_ui()
         self._poll_queue()
         self._refresh_chapter_list()
@@ -167,6 +171,14 @@ class NovelGenApp(ctk.CTk):
         ctk.CTkButton(
             bar, text="+ New", width=70, command=self._new_story,
         ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            bar, text="Rename", width=80, fg_color="gray30", hover_color="gray40",
+            command=self._rename_story,
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            bar, text="Delete", width=80, fg_color="#8B0000", hover_color="#a00000",
+            command=self._delete_story,
+        ).pack(side="left", padx=(8, 0))
 
     def _story_titles(self) -> list[str]:
         self._story_options = {s["book_title"]: s["story_id"] for s in db.list_stories(DB_PATH)}
@@ -206,11 +218,73 @@ class NovelGenApp(ctk.CTk):
         self._story_menu.set(title)
         self._on_story_selected(title)
 
+    def _rename_story(self):
+        if self._running:
+            return
+        dialog = ctk.CTkInputDialog(text=f"New title for “{self._book_title}”:", title="Rename story")
+        new_title = (dialog.get_input() or "").strip()
+        if not new_title or new_title == self._book_title:
+            return
+        if new_title in {s["book_title"] for s in db.list_stories(DB_PATH)}:
+            self._status.configure(text=f"A story named “{new_title}” already exists.", text_color=_WARN_COLOR)
+            return
+        old_title = self._book_title
+        db.rename_story(self._story_id, new_title, DB_PATH)
+        # Move the manuscripts folder (named by title) so chapters still resolve.
+        try:
+            old_dir, new_dir = MANUSCRIPTS / old_title, MANUSCRIPTS / new_title
+            if old_dir.exists() and not new_dir.exists():
+                old_dir.rename(new_dir)
+        except OSError:
+            pass
+        self._book_title = new_title
+        self._story_menu.configure(values=self._story_titles())
+        self._story_menu.set(new_title)
+        self._refresh_chapter_list()
+        self._status.configure(text=f"Renamed to “{new_title}”.", text_color="gray60")
+
+    def _delete_story(self):
+        if self._running:
+            return
+        if not messagebox.askyesno(
+            "Delete story",
+            f"Permanently delete “{self._book_title}” — all its characters, locations, plotlines, "
+            "chapters, and world data?\n\nA pre-delete backup is taken first, but otherwise this "
+            "cannot be undone.",
+            icon="warning", default="no",
+        ):
+            return
+        import shutil
+        try:
+            db.create_backup(DB_PATH, tag="predelete", chroma_path=CHROMA_PATH)
+        except Exception:
+            pass
+        title = self._book_title
+        db.delete_story(self._story_id, DB_PATH)
+        book_dir = MANUSCRIPTS / title
+        if book_dir.exists():
+            shutil.rmtree(book_dir, ignore_errors=True)
+
+        # Always leave at least one story to land on.
+        stories = db.list_stories(DB_PATH)
+        if not stories:
+            db.create_story(DEFAULT_STORY_ID, DEFAULT_BOOK_TITLE, DB_PATH)
+            stories = db.list_stories(DB_PATH)
+        self._story_id = stories[0]["story_id"]
+        self._book_title = stories[0]["book_title"]
+        self._story_menu.configure(values=self._story_titles())
+        self._story_menu.set(self._book_title)
+        self._load_story_tabs()
+        self._clear_prose()
+        self._refresh_chapter_list()
+        self._status.configure(text=f"Deleted “{title}”.", text_color="gray60")
+
     # ── Chapters tab ──────────────────────────────────────────────────────
 
     def _build_chapters_tab(self):
         tab = self._tabs.add("Chapters")
         tab.grid_rowconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=0)  # action bar under the prose
         tab.grid_columnconfigure(0, weight=0)  # list panel — fixed width
         tab.grid_columnconfigure(1, weight=1)  # prose panel — fills remaining
 
@@ -218,7 +292,7 @@ class NovelGenApp(ctk.CTk):
         self._chapter_list_frame = ctk.CTkScrollableFrame(
             tab, width=200, label_text=self._book_title, label_font=("", 12, "bold"),
         )
-        self._chapter_list_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self._chapter_list_frame.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 8))
         self._chapter_buttons: list[ctk.CTkButton] = []
 
         # Right: prose viewer
@@ -229,6 +303,35 @@ class NovelGenApp(ctk.CTk):
             wrap="word",
         )
         self._prose_view.grid(row=0, column=1, sticky="nsew")
+
+        # Action bar: Edit / Save / Cancel (left) + Delete (right)
+        self._current_chapter_path: Path | None = None
+        self._editing = False
+        self._edit_first_line = ""
+
+        actions = ctk.CTkFrame(tab, fg_color="transparent")
+        actions.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+
+        self._edit_btn = ctk.CTkButton(actions, text="Edit", width=90, state="disabled",
+                                       command=self._begin_edit)
+        self._edit_btn.pack(side="left")
+        self._save_edit_btn = ctk.CTkButton(actions, text="Save", width=90, command=self._save_edit)
+        self._cancel_edit_btn = ctk.CTkButton(actions, text="Cancel", width=90,
+                                              fg_color="gray30", hover_color="gray40",
+                                              command=self._cancel_edit)
+        self._regen_btn = ctk.CTkButton(actions, text="Regenerate", width=110, state="disabled",
+                                        command=self._regenerate_chapter)
+        self._regen_btn.pack(side="left", padx=(8, 0))
+        self._regen_para_btn = ctk.CTkButton(actions, text="Regenerate ¶", width=120, state="disabled",
+                                             command=self._regenerate_paragraph)
+        self._regen_para_btn.pack(side="left", padx=(8, 0))
+        self._edit_status = ctk.CTkLabel(actions, text="", text_color="gray60", font=("", 11))
+        self._edit_status.pack(side="left", padx=10)
+
+        self._del_chapter_btn = ctk.CTkButton(actions, text="Delete Chapter", width=120, state="disabled",
+                                              fg_color="#8B0000", hover_color="#a00000",
+                                              command=self._delete_chapter)
+        self._del_chapter_btn.pack(side="right")
 
     def _chapter_meta(self, path: Path) -> tuple[bool, int]:
         """Return (flagged, word_count) parsed from a chapter file's header,
@@ -284,17 +387,210 @@ class NovelGenApp(ctk.CTk):
         self._chapter_list_frame.configure(label_text=summary)
 
     def _load_chapter(self, path: Path):
+        self._exit_edit_mode()
+        self._current_chapter_path = path
         text = path.read_text(encoding="utf-8")
         self._prose_view.configure(state="normal")
         self._prose_view.delete("1.0", "end")
         self._prose_view.insert("end", text)
         self._prose_view.configure(state="disabled")
         self._prose_view.see("1.0")
+        self._edit_status.configure(text="")
+        self._sync_chapter_buttons()
 
     def _clear_prose(self):
+        self._exit_edit_mode()
+        self._current_chapter_path = None
         self._prose_view.configure(state="normal")
         self._prose_view.delete("1.0", "end")
         self._prose_view.configure(state="disabled")
+        self._edit_status.configure(text="")
+        self._sync_chapter_buttons()
+
+    def _sync_chapter_buttons(self):
+        """Enable the chapter actions only when a chapter is loaded, nothing is
+        generating, and we're not mid-edit."""
+        ok = self._current_chapter_path is not None and not self._running and not getattr(self, "_editing", False)
+        state = "normal" if ok else "disabled"
+        for b in (self._edit_btn, self._del_chapter_btn, self._regen_btn, self._regen_para_btn):
+            b.configure(state=state)
+
+    # ── Prose editing ─────────────────────────────────────────────────────
+
+    def _exit_edit_mode(self):
+        """Leave edit mode (if in it) and restore the read-only button layout."""
+        if getattr(self, "_editing", False):
+            self._save_edit_btn.pack_forget()
+            self._cancel_edit_btn.pack_forget()
+            self._edit_btn.pack(side="left")
+            self._editing = False
+            self._sync_chapter_buttons()
+
+    def _begin_edit(self):
+        if self._running or self._current_chapter_path is None:
+            return
+        text = self._current_chapter_path.read_text(encoding="utf-8")
+        header, _, body = text.partition("\n\n")   # header block, then prose
+        self._edit_first_line = header.split("\n", 1)[0]  # preserves "CHAPTER n [FLAGGED…]"
+        self._prose_view.configure(state="normal")
+        self._prose_view.delete("1.0", "end")
+        self._prose_view.insert("1.0", body.rstrip("\n"))
+        self._prose_view.focus_set()
+        # swap Edit → Save + Cancel
+        self._edit_btn.pack_forget()
+        self._save_edit_btn.pack(side="left")
+        self._cancel_edit_btn.pack(side="left", padx=(8, 0))
+        self._editing = True
+        self._sync_chapter_buttons()  # disable regen/delete while editing
+        self._edit_status.configure(text="Editing prose — the header is regenerated on save.")
+
+    def _save_edit(self):
+        if self._current_chapter_path is None:
+            return
+        body = self._prose_view.get("1.0", "end").strip()
+        wc = len(body.split())
+        new_text = f"{self._edit_first_line}\n{'='*60}\n({wc:,} words)\n\n{body}\n"
+        try:
+            self._current_chapter_path.write_text(new_text, encoding="utf-8")
+        except OSError as e:
+            self._edit_status.configure(text=f"Save failed: {e}", text_color=_WARN_COLOR)
+            return
+        path = self._current_chapter_path
+        self._load_chapter(path)          # exits edit mode + reloads read-only view
+        self._refresh_chapter_list()      # word count / label update
+        self._edit_status.configure(text=f"Saved ({wc:,} words).", text_color="#4caf50")
+
+    def _cancel_edit(self):
+        if self._current_chapter_path is not None:
+            self._load_chapter(self._current_chapter_path)  # reload discards edits
+        self._edit_status.configure(text="")
+
+    def _delete_chapter(self):
+        if self._running or self._current_chapter_path is None:
+            return
+        path = self._current_chapter_path
+        try:
+            n = int(path.stem.split()[-1])
+        except (ValueError, IndexError):
+            return
+        if not messagebox.askyesno(
+            "Delete chapter",
+            f"Delete Chapter {n} of “{self._book_title}”?\n\nThis removes the file and its records. "
+            "World-state changes it made are not undone; deleting a middle chapter leaves a gap "
+            "(deleting the latest chapter frees its number for a re-run).",
+            icon="warning", default="no",
+        ):
+            return
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        db.delete_chapter(self._story_id, n, DB_PATH)
+        self._clear_prose()
+        self._refresh_chapter_list()
+        self._status.configure(text=f"Deleted Chapter {n}.", text_color="gray60")
+
+    # ── Regeneration (feedback-driven) ────────────────────────────────────
+
+    def _ask_feedback(self, title: str, prompt: str) -> str:
+        dialog = ctk.CTkInputDialog(text=prompt, title=title)
+        return (dialog.get_input() or "").strip()
+
+    def _regenerate_chapter(self):
+        if self._running or self._current_chapter_path is None or getattr(self, "_editing", False):
+            return
+        feedback = self._ask_feedback(
+            "Regenerate chapter",
+            "What should change? Your feedback guides the full rewrite:",
+        )
+        if not feedback:
+            return
+        path = self._current_chapter_path
+        self._cancel_event.clear()
+        self._gen_start = time.time()
+        self._stage_label, self._stage_step, self._stage_total = "Regenerating chapter…", 0, 0
+        self._set_busy(True)
+        self._append_log(f"\n♻ Regenerating {path.stem} — feedback: {feedback}\n", tag="header")
+        writer = _QueueWriter(self._output_queue)
+        threading.Thread(target=self._run_regen_chapter, args=(path, feedback, writer), daemon=True).start()
+
+    def _run_regen_chapter(self, path: Path, feedback: str, writer: _QueueWriter):
+        try:
+            import regenerate
+            from pipeline import GenerationCancelled
+
+            def progress(step, total, label):
+                self._output_queue.put(("progress", (step, total, label)))
+
+            try:
+                regenerate.regenerate_chapter(
+                    story_id=self._story_id, db_path=DB_PATH, chroma_path=CHROMA_PATH,
+                    manuscripts_dir=MANUSCRIPTS, book_title=self._book_title,
+                    chapter_path=path, feedback=feedback, print_fn=writer,
+                    should_cancel=self._cancel_event.is_set, progress_fn=progress,
+                )
+                self._output_queue.put(("refresh_chapters", None))
+                self._output_queue.put(("reload_chapter", str(path)))
+            except GenerationCancelled:
+                writer("\n⏹ Regeneration cancelled — chapter unchanged.")
+        except Exception as exc:
+            import traceback
+            writer(f"\n[ERROR] {exc}")
+            writer(traceback.format_exc())
+        finally:
+            self._output_queue.put(("done", None))
+
+    def _regenerate_paragraph(self):
+        if self._running or self._current_chapter_path is None or getattr(self, "_editing", False):
+            return
+        try:
+            selection = self._prose_view._textbox.get("sel.first", "sel.last").strip()
+        except Exception:
+            selection = ""
+        if not selection:
+            self._edit_status.configure(text="Select a passage in the prose first.", text_color=_WARN_COLOR)
+            return
+        text = self._current_chapter_path.read_text(encoding="utf-8")
+        header, _, body = text.partition("\n\n")
+        if selection not in body:
+            self._edit_status.configure(text="Select a passage within the chapter prose (not the header).",
+                                        text_color=_WARN_COLOR)
+            return
+        feedback = self._ask_feedback("Regenerate passage", "How should this passage change?")
+        if not feedback:
+            return
+        path = self._current_chapter_path
+        first_line = header.split("\n", 1)[0]
+        self._cancel_event.clear()
+        self._gen_start = time.time()
+        self._stage_label, self._stage_step, self._stage_total = "Revising passage…", 0, 0
+        self._set_busy(True)
+        self._append_log(f"\n♻ Revising a passage of {path.stem} — feedback: {feedback}\n", tag="header")
+        writer = _QueueWriter(self._output_queue)
+        threading.Thread(
+            target=self._run_regen_paragraph,
+            args=(path, first_line, body, selection, feedback, writer), daemon=True,
+        ).start()
+
+    def _run_regen_paragraph(self, path, first_line, body, selection, feedback, writer):
+        try:
+            import regenerate
+            new_para = regenerate.regenerate_paragraph(
+                story_id=self._story_id, db_path=DB_PATH,
+                chapter_body=body, paragraph=selection, feedback=feedback, print_fn=writer,
+            )
+            new_body = body.replace(selection, new_para, 1).strip()
+            wc = len(new_body.split())
+            path.write_text(f"{first_line}\n{'='*60}\n({wc:,} words)\n\n{new_body}\n", encoding="utf-8")
+            writer(f"  Passage rewritten ({len(new_para.split())} words); chapter now {wc:,} words.")
+            self._output_queue.put(("refresh_chapters", None))
+            self._output_queue.put(("reload_chapter", str(path)))
+        except Exception as exc:
+            import traceback
+            writer(f"\n[ERROR] {exc}")
+            writer(traceback.format_exc())
+        finally:
+            self._output_queue.put(("done", None))
 
     # ── World Bible / Prompts tabs ────────────────────────────────────────
 
@@ -370,6 +666,22 @@ class NovelGenApp(ctk.CTk):
         )
         self._settings_status.pack(anchor="w", pady=(12, 0))
 
+        # ── Typewriter output ────────────────────────────────────────────
+        ctk.CTkLabel(frame, text="Output style", font=("", 15, "bold")).pack(anchor="w", pady=(26, 0))
+        self._typewriter_var = ctk.BooleanVar(value=self._typewriter)
+        ctk.CTkCheckBox(
+            frame,
+            text="Typewriter output — stream prose token-by-token as it's written",
+            variable=self._typewriter_var, command=self._toggle_typewriter,
+            font=("", 12), checkbox_width=18, checkbox_height=18,
+        ).pack(anchor="w", pady=(4, 0))
+        ctk.CTkLabel(
+            frame,
+            text="Off by default: the writer just reports the finished word count. On: watch the "
+                 "chapter appear live in the Chat log (doesn't change speed, only how it's shown).",
+            text_color="gray60", font=("", 11), justify="left", wraplength=560,
+        ).pack(anchor="w", pady=(2, 0))
+
         # ── Generation quality ───────────────────────────────────────────
         ctk.CTkLabel(frame, text="Generation quality", font=("", 15, "bold")).pack(anchor="w", pady=(26, 0))
         ctk.CTkLabel(
@@ -440,8 +752,9 @@ class NovelGenApp(ctk.CTk):
         for b in backups:
             r = ctk.CTkFrame(self._backups_frame, fg_color="transparent")
             r.pack(fill="x", pady=2)
+            extra = "+ vectors" if b.get("has_chroma") else "DB only"
             ctk.CTkLabel(
-                r, text=f"{b['label']}  ·  {b['when']}  ·  {b['size_kb']:,} KB",
+                r, text=f"{b['label']}  ·  {b['when']}  ·  {b['size_kb']:,} KB  ·  {extra}",
                 font=("", 11), anchor="w",
             ).pack(side="left")
             ctk.CTkButton(
@@ -455,7 +768,7 @@ class NovelGenApp(ctk.CTk):
             self._settings_status.configure(text="Can't back up while generating.", text_color=_WARN_COLOR)
             return
         try:
-            dest = db.create_backup(DB_PATH, tag="manual")
+            dest = db.create_backup(DB_PATH, tag="manual", chroma_path=CHROMA_PATH)
         except Exception as e:
             self._settings_status.configure(text=f"Backup failed: {e}", text_color=_WARN_COLOR)
             return
@@ -472,13 +785,14 @@ class NovelGenApp(ctk.CTk):
         if not messagebox.askyesno(
             "Restore backup",
             f"Restore “{label}” from {when}?\n\n"
-            "This rolls the ENTIRE database (all stories) back to that snapshot. "
-            "Your current state will be saved first as a pre-restore backup, so this can be undone.",
+            "This rolls the ENTIRE database (all stories) — and its vector store, if the "
+            "snapshot captured one — back to that point. Your current state is saved first "
+            "as a pre-restore backup, so this can be undone.",
             icon="warning", default="no",
         ):
             return
         try:
-            db.restore_backup(path, DB_PATH)
+            db.restore_backup(path, DB_PATH, chroma_path=CHROMA_PATH)
         except Exception as e:
             self._settings_status.configure(text=f"Restore failed: {e}", text_color=_WARN_COLOR)
             return
@@ -514,6 +828,11 @@ class NovelGenApp(ctk.CTk):
         self._clear_prose()
         self._refresh_chapter_list()
         self._refresh_backups()
+
+    def _toggle_typewriter(self):
+        self._typewriter = self._typewriter_var.get()
+        db.set_setting("typewriter", "1" if self._typewriter else "0", DB_PATH)
+        self._apply_typewriter()
 
     def _model_choices(self) -> list[str]:
         current = llm_client.get_model()
@@ -678,8 +997,14 @@ class NovelGenApp(ctk.CTk):
                     self._append_log(payload, tag=self._classify_tag(payload))
                 elif kind == "progress":
                     self._stage_step, self._stage_total, self._stage_label = payload
+                elif kind == "stream":
+                    self._append_log(payload, tag="prose")
                 elif kind == "refresh_chapters":
                     self._refresh_chapter_list()
+                elif kind == "reload_chapter":
+                    p = Path(payload)
+                    if p.exists():
+                        self._load_chapter(p)
                 elif kind == "done":
                     self._set_busy(False)
         except queue.Empty:
@@ -689,6 +1014,15 @@ class NovelGenApp(ctk.CTk):
         if self._running:
             self._update_running_status()
         self.after(100, self._poll_queue)
+
+    def _stream_token(self, text: str):
+        """Sink for llm_client streaming — runs on the worker thread, so it only
+        enqueues; the main thread renders it in _poll_queue."""
+        self._output_queue.put(("stream", text))
+
+    def _apply_typewriter(self):
+        """Register or clear the streaming sink to match the current setting."""
+        llm_client.set_stream_sink(self._stream_token if self._typewriter else None)
 
     def _update_running_status(self):
         elapsed = _fmt_elapsed(time.time() - self._gen_start)
@@ -725,6 +1059,7 @@ class NovelGenApp(ctk.CTk):
         self._stop_btn.configure(state="normal" if busy else "disabled")
         self._chat_input.configure(state="disabled" if busy else "normal")
         self._story_menu.configure(state="disabled" if busy else "normal")
+        self._sync_chapter_buttons()  # disable Edit/Regenerate/Delete while busy
         if not busy:
             self._status.configure(text="Ready.")
 

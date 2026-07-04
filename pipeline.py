@@ -50,13 +50,14 @@ def _section(p, title: str) -> None:
     p(f"{'='*60}")
 
 
-def _backup_database(db_path: Path, chapter_number: int, print_fn=print) -> None:
-    """Snapshot the DB to backups/ before this chapter's writes begin. Never
-    blocks generation — a failure here only warns, since losing a backup is far
-    less costly than losing the DB. (db.create_backup checkpoints + prunes.)"""
+def _backup_database(db_path: Path, chapter_number: int, print_fn=print, chroma_path=None) -> None:
+    """Snapshot the DB (and vector store) to backups/ before this chapter's
+    writes begin. Never blocks generation — a failure here only warns, since
+    losing a backup is far less costly than losing the DB. (db.create_backup
+    checkpoints, snapshots Chroma, and prunes.)"""
     try:
         import db as db_module
-        db_module.create_backup(db_path, tag=f"ch{chapter_number}")
+        db_module.create_backup(db_path, tag=f"ch{chapter_number}", chroma_path=chroma_path)
     except Exception as e:
         print_fn(f"  [warn] Database backup failed (continuing anyway): {e}")
 
@@ -348,7 +349,7 @@ def run_chapter(
     # chapter number). Skipped on resume — the pre-chapter snapshot already
     # exists, and a new one would capture mid-chapter state under the same tag.
     if not done_stages:
-        _backup_database(db_path, state.chapter_number, print_fn=p)
+        _backup_database(db_path, state.chapter_number, print_fn=p, chroma_path=chroma_path)
 
     # ── Outline Manager (load, or generate on cold start) ─────────
     if _run("outline"):
